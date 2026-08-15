@@ -20,10 +20,12 @@ const KNOWN_SCOPES = ["mcp.read", "mcp.write", "mcp.delete"];
 /** Reduce a raw XSUAA `scope` claim to the bare scope names this server checks. */
 function resolveOauthScopes(rawScope) {
   const raw = Array.isArray(rawScope) ? rawScope : [];
-  const matched = KNOWN_SCOPES.filter((known) => raw.some((s) => s === known || s.endsWith(`.${known}`)));
-  // A token with none of the three scopes (e.g. a legacy token carrying only the old
-  // flat "Use" scope) gets read-only, not full access — least privilege by default.
-  return matched.length ? matched : ["mcp.read"];
+  // No default/fallback scope: a token carrying none of the three real scopes (e.g. a
+  // caller with no Role Collection assigned at all) gets an empty scope set, which
+  // denies every tool outright (see hasScope in requestScope.js) rather than silently
+  // granting read access. Only Support/Developer/Architect exist — there is no
+  // implicit "everyone gets at least read" tier.
+  return KNOWN_SCOPES.filter((known) => raw.some((s) => s === known || s.endsWith(`.${known}`)));
 }
 
 export function getXsuaaCredentials() {

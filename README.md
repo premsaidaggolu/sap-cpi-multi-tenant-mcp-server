@@ -1,19 +1,28 @@
 # SAP CPI MCP Server
 
+**Version 1.1.0**
+
 A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an MCP client
 (Claude Desktop, Claude Code, etc.) **monitor and manage SAP Cloud Integration (CPI / Integration
 Suite)** through its **OData v1 APIs** — the same surface documented as the "Cloud Integration"
 package on the SAP Business Accelerator Hub.
 
 It runs locally over **stdio** or as an HTTP service you can deploy to **SAP BTP Cloud Foundry**.
+One server instance can talk to a **single CPI tenant or many** — see
+[Multi-tenant support](#multi-tenant-support) below.
 
-**45 tools**: curated tools for the common workflows, plus generic escape-hatch tools
+**48 tools**: curated tools for the common workflows, plus generic escape-hatch tools
 (`cpi_query`, `cpi_get_entity`, `cpi_invoke_function`, `cpi_write`) that reach **any** of the
 ~130 entity sets and 35 operations the API exposes.
 
 ---
 
 ## What it can do (tools)
+
+### Tenant discovery
+| Tool | Purpose |
+|------|---------|
+| `list_cpi_tenants` | List the CPI tenants this server is configured to reach — call this first when it isn't already clear which one to use |
 
 ### Monitoring — Message Processing Logs (MPL)
 | Tool | Purpose |
@@ -40,6 +49,44 @@ It runs locally over **stdio** or as an HTTP service you can deploy to **SAP BTP
 | `get_flow_configurations` / `update_flow_configuration` ⚠️ | Externalized parameters |
 | `get_flow_resources` | Scripts/XSDs/WSDLs inside a flow |
 | `where_used` | Search a word/string (e.g. a credential name, endpoint, or value) across flow content — process XML, adapter properties, scripts, mappings, parameter files — one package, one flow, or the whole tenant |
+
+### Flow authoring — build real content from a spec
+| Tool | Purpose |
+|------|---------|
+| `build_integration_flow` ⚠️ | Author **real iFlow content** (not just an empty shell) from a structured step spec, and deploy it end to end |
+
+`create_integration_flow` above only makes an empty shell — there's no SAP API to add a
+step at a time. `build_integration_flow` is the encoded version of that whole manual
+process: give it an ordered `steps` array and it generates the confirmed-schema
+BPMN2/`ifl:` XML, splices it into a real tenant-generated shell, pushes it, deploys it,
+and polls until it finishes (or a bounded timeout, so a complex flow still resolves in
+minutes, not indefinitely). All of the hard-won gotchas below are applied automatically
+— you don't need a separate skill/instructions file loaded to get them right.
+
+Supported step kinds (first step must be `timer` — no other trigger is encoded yet):
+`timer`, `contentModifier`, `router`, `groovyScript`, `requestReply` / `send` (with an
+`http` or `mail` adapter), `endEvent`. A step type outside this list is rejected with a
+clear error rather than a guessed XML shape.
+
+Auto-fixes applied for you:
+- Camel Simple `==` is rewritten to `=` (CPI's condition parser only accepts `=`).
+- An unquoted router-condition comparison value gets quoted (CPI's Problems tab flags
+  a bare number/placeholder even though it's still numerically compared at runtime).
+- Element/participant names have whitespace replaced with `_` (CPI rejects whitespace
+  in a participant name outright).
+- A `{{Placeholder}}` used in a step but not declared in `parameters` is auto-added as
+  an optional externalized parameter, with a warning.
+
+On any challenge — a build failure, a deploy that times out, or a runtime start error —
+the tool doesn't just report failure: the `challenge` field explains what happened and
+points you at `download_integration_flow(artifactId)` to fetch the already-pushed
+content back for inspection (SAP's OData API famously returns no detail for a build
+failure; the zip, imported into the web editor's Problems tab, is the reliable way to
+see the real error). Nothing is written to this server's local disk on that path —
+once content is pushed, the tenant itself is the copy of record. Pass `offline: true`
+to skip the tenant entirely and just generate a preview zip locally in
+`generated-iflows/` — that's the one mode where a local file is the only copy that
+will ever exist.
 
 ### Runtime & deployment
 | Tool | Purpose |
@@ -91,6 +138,74 @@ ALLOW_WRITE=true    # enable the ⚠️ tools
 
 ---
 
+## Multi-tenant support
+
+One running server can reach **one CPI tenant (the default) or several**, decided purely by
+what's in `.env` — no code change either way.
+
+### Single tenant (default)
+
+The plain vars — `CPI_BASE_URL` / `CPI_TOKEN_URL` / `CPI_CLIENT_ID` / `CPI_CLIENT_SECRET` — work
+exactly as before. No tool gains an extra argument; nothing else in this section applies.
+
+### Multiple tenants
+
+Add a numbered group of the same four vars per tenant — `CPI_BASE_URL1`, `CPI_BASE_URL2`,
+`CPI_BASE_URL3`, ... — and the server discovers however many it finds at startup:
+
+```bash
+CPI_BASE_URL1=https://dev-tenant.it-cpiXXX.cfapps.eu10.hana.ondemand.com/api/v1
+CPI_TOKEN_URL1=https://dev-subdomain.authentication.eu10.hana.ondemand.com/oauth/token
+CPI_CLIENT_ID1=dev-client-id
+CPI_CLIENT_SECRET1=dev-client-secret
+TENANT_NAME1=Dev
+
+CPI_BASE_URL2=https://qa-tenant.it-cpiXXX.cfapps.eu10.hana.ondemand.com/api/v1
+CPI_TOKEN_URL2=https://qa-subdomain.authentication.eu10.hana.ondemand.com/oauth/token
+CPI_CLIENT_ID2=qa-client-id
+CPI_CLIENT_SECRET2=qa-client-secret
+TENANT_NAME2=QA
+```
+
+Once **2 or more** tenants are configured:
+
+- Every tool gains a required `tenant` argument — a fixed enum of the exact `TENANT_NAME<N>`
+  values found (case-insensitive match, but the MCP client sees these exact names). The client
+  (Claude) has to ask which tenant to use rather than guessing.
+- Call `list_cpi_tenants` any time to see the current list — it's the one tool that never needs
+  a `tenant` itself.
+- `TENANT_NAME<N>` defaults to `tenant<N>` if omitted, but naming it is strongly recommended —
+  that name is what shows up in every tool's schema and in Claude's prompts.
+
+Adding a 3rd, 4th, ... Nth tenant later is **just adding another numbered block** — no code
+change, no redeploy of anything but the env file itself. Restart the MCP server connection
+after editing `.env` (or `cf set-env` + `cf restage` for the HTTP deployment) so it re-reads it.
+
+### Per-tenant overrides
+
+Two flags can be scoped to one tenant instead of the whole server:
+
+```bash
+# Allow writes on Dev only, even if the global ALLOW_WRITE below is false:
+ALLOW_WRITE1=true
+
+# Take a tenant out of rotation without deleting its credentials — it disappears from
+# list_cpi_tenants, the `tenant` enum, and multi-tenant mode entirely (falls back to
+# single-tenant behavior if only one enabled tenant remains):
+STATUS2=disable   # "disable"/"disabled" to turn off; unset or "enable" = on (default)
+```
+
+### Isolation guarantees
+
+- Each tenant gets its **own OAuth access-token cache and CSRF/session-cookie cache** — a busy
+  Dev tenant's token can never be reused for a Prod call, even under load.
+- Error messages and results are host-masked **per tenant**, so one tenant's real hostname never
+  leaks through a call made against another.
+- `ALLOW_WRITE<N>` and `STATUS<N>` are independent per tenant; nothing else (RBAC scopes,
+  auth mode) is tenant-aware — those still apply server-wide.
+
+---
+
 ## Role-based access control (RBAC)
 
 Three roles, layered on top of `ALLOW_WRITE`/`confirm=true` rather than replacing them:
@@ -112,9 +227,10 @@ modes grant full access to everyone (no per-user identity to hang a role off), a
 
 ### Setting it up in BTP
 
-1. `xs-security.json` already defines the scopes and role templates (`Support`, `Developer`,
-   `Architect` — plus the legacy `CpiMcpUser`/`Use` scope, kept so anyone already assigned it
-   keeps working, treated as read-only). Push the updated descriptor:
+1. `xs-security.json` defines exactly three scopes and role templates — `Support`, `Developer`,
+   `Architect`. There is no legacy/default role: a caller not assigned one of these three gets
+   an empty scope set and no tools at all (see `resolveOauthScopes` in `src/auth.js`), not
+   silent read-only access. Push the updated descriptor:
    ```bash
    cf update-service sap-cpi-mcp-xsuaa -c xs-security.json
    cf restage sap-cpi-mcp-server
@@ -216,6 +332,9 @@ npm install
 cp .env.example .env      # then edit .env with your service-key values
 ```
 
+For more than one tenant, use the numbered vars (`CPI_BASE_URL1`, `CPI_BASE_URL2`, ...) instead
+— see [Multi-tenant support](#multi-tenant-support) above. `.env.example` documents both forms.
+
 Add to your MCP client config (Claude Desktop `claude_desktop_config.json`):
 
 ```json
@@ -294,6 +413,8 @@ Connect an HTTP-capable MCP client:
 - "Get the error details for MessageGuid `AGh...`."
 - "List integration flows in package `MyIntegrationPackage` and tell me which are deployed."
 - "Is the `OrderReplication` flow deployed and started? If not, why?"
+- "Which CPI tenants are configured?" *(multi-tenant setups — calls `list_cpi_tenants`)*
+- "Show failed messages in the last 24 hours on the QA tenant." *(multi-tenant — Claude fills in `tenant=QA`)*
 
 ---
 
@@ -307,3 +428,21 @@ Connect an HTTP-capable MCP client:
 - Time filters use OData datetime literals: `LogEnd gt datetime'2024-01-01T00:00:00'`.
 
 Requires **Node.js 18+** (uses the built-in `fetch`).
+
+---
+
+## Changelog
+
+### 1.1.0
+- `build_integration_flow` no longer writes a copy of pushed content to
+  `generated-iflows/` on this server's local disk. Once content is pushed to a tenant,
+  the tenant is the copy of record — `download_integration_flow(artifactId)` fetches it
+  back any time it's needed (e.g. to inspect a build failure in the web editor's
+  Problems tab). The one exception is `offline: true`, which never touches a tenant at
+  all, so its preview zip is still saved locally (that's the only copy that will ever
+  exist).
+- Corrected the tool count (48, not 46/45/42 as previously stated in various docs).
+
+### 1.0.0
+- Initial release: monitoring, design-time content, runtime/deployment, admin, generic
+  escape-hatch tools, `where_used`, multi-tenant support, RBAC, and `build_integration_flow`.

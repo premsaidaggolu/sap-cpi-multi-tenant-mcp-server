@@ -4,10 +4,6 @@
   "description": "OAuth security for the SAP CPI MCP server",
   "scopes": [
     {
-      "name": "$XSAPPNAME.Use",
-      "description": "Legacy: permission to call the SAP CPI MCP server (pre-RBAC, kept so existing assignments keep working)"
-    },
-    {
       "name": "$XSAPPNAME.mcp.read",
       "description": "Read MPLs, packages, flows, deployed artifacts, security material, etc."
     },
@@ -21,11 +17,6 @@
     }
   ],
   "role-templates": [
-    {
-      "name": "CpiMcpUser",
-      "description": "Legacy role — treated as read-only by the server (kept so existing assignments keep working)",
-      "scope-references": ["$XSAPPNAME.Use"]
-    },
     {
       "name": "Support",
       "description": "Read-only: monitoring, MPL search, package/flow inspection",

@@ -1,8 +1,10 @@
 // Design-time content domain: packages, integration flows, mappings, script
 // collections, configurations, resources.
 import { z } from "zod";
+import { readFile } from "node:fs/promises";
 import { cpiGet, cpiRequest, cpiInvoke, odataString } from "../cpiClient.js";
 import { readHandler, writeHandler, registerScopedTool } from "./helpers.js";
+import { sanitizeTechnicalId } from "../iflow/xml.js";
 
 export function registerContentTools(server) {
   // --- Packages -----------------------------------------------------------
@@ -30,9 +32,12 @@ export function registerContentTools(server) {
     "create_integration_package",
     {
       title: "Create Integration Package",
-      description: "Create a new integration package. Requires ALLOW_WRITE.",
+      description:
+        "Create a new integration package. Requires ALLOW_WRITE. The technical Id is auto-sanitized (CPI " +
+        "rejects underscores/spaces/special characters in it with 'Property 'Id' value cannot have a special " +
+        "character') — the original text is kept as the display Name/ShortText, unaffected.",
       inputSchema: {
-        id: z.string().describe("Technical Id (no spaces)."),
+        id: z.string().describe("Technical Id — non-alphanumeric characters are stripped automatically."),
         name: z.string(),
         shortText: z.string().optional(),
         description: z.string().optional(),
@@ -40,11 +45,19 @@ export function registerContentTools(server) {
       },
     },
     writeHandler(
-      ({ id, name, shortText, description }) =>
-        cpiRequest("POST", "/IntegrationPackages", {
-          body: { Id: id, Name: name, ShortText: shortText || name, Description: description || "" },
-        }),
-      { action: ({ id }) => `create integration package '${id}'` }
+      async ({ id, name, shortText, description }) => {
+        const sanitizedId = sanitizeTechnicalId(id);
+        const result = await cpiRequest("POST", "/IntegrationPackages", {
+          body: { Id: sanitizedId, Name: name, ShortText: shortText || name, Description: description || "" },
+        });
+        if (sanitizedId === id) return result;
+        return {
+          ...result,
+          id: sanitizedId,
+          note: `Id "${id}" contained characters CPI rejects — created as "${sanitizedId}" instead. Name/ShortText keep your original text.`,
+        };
+      },
+      { action: ({ id }) => `create integration package '${sanitizeTechnicalId(id)}'` }
     )
   );
 
@@ -130,6 +143,57 @@ export function registerContentTools(server) {
         content: buf.toString("base64"),
       };
     })
+  );
+
+  registerScopedTool(server,
+    "push_integration_flow_content",
+    {
+      title: "Push Raw Integration Flow Content (zip)",
+      description:
+        "Overwrite an EXISTING integration flow's content with a raw zip you already have — e.g. one downloaded " +
+        "via download_integration_flow and hand-edited locally, or one build_integration_flow generated in " +
+        "offline mode (its zipFilePath — an online build never leaves a local file, since the content is already " +
+        "on the tenant). Just replaces ArtifactContent as-is; doesn't touch the manifest/shell, and doesn't create " +
+        "the artifact if it doesn't exist yet (use create_integration_flow or build_integration_flow for that). " +
+        "Requires ALLOW_WRITE.",
+      inputSchema: {
+        artifactId: z.string(),
+        version: z.string().default("active"),
+        name: z.string().optional().describe("Display name to set alongside the content. Omit to keep the artifact's current Name (fetched automatically)."),
+        zipFilePath: z
+          .string()
+          .optional()
+          .describe(
+            "Absolute path to a zip file already on THIS SERVER's filesystem (e.g. an offline " +
+              "build_integration_flow's zipFilePath). Preferred over zipBase64 — reads the bytes directly server-" +
+              "side instead of round-tripping a large base64 blob through the caller, which is itself a real " +
+              "corruption risk for anything past a few KB. Exactly one of zipFilePath/zipBase64 is required."
+          ),
+        zipBase64: z.string().optional().describe("Base64-encoded zip content, for when the caller only has it in memory. Exactly one of zipFilePath/zipBase64 is required."),
+        confirm: z.boolean().optional().describe("Must be true to proceed."),
+      },
+    },
+    writeHandler(
+      async ({ artifactId, version, name, zipFilePath, zipBase64 }) => {
+        if (!zipFilePath && !zipBase64) throw new Error("Provide either zipFilePath or zipBase64.");
+        if (zipFilePath && zipBase64) throw new Error("Provide only one of zipFilePath or zipBase64, not both.");
+        const buf = zipFilePath ? await readFile(zipFilePath) : Buffer.from(zipBase64, "base64");
+
+        let effectiveName = name;
+        if (!effectiveName) {
+          const current = await cpiGet(`/IntegrationDesigntimeArtifacts(Id=${odataString(artifactId)},Version=${odataString(version)})`);
+          effectiveName = current && current.Name;
+        }
+
+        const result = await cpiRequest(
+          "PUT",
+          `/IntegrationDesigntimeArtifacts(Id=${odataString(artifactId)},Version=${odataString(version)})`,
+          { body: { Name: effectiveName, ArtifactContent: buf.toString("base64") } }
+        );
+        return { artifactId, version, name: effectiveName, zipSizeBytes: buf.length, result };
+      },
+      { action: ({ artifactId }) => `overwrite integration flow '${artifactId}' with raw pushed zip content` }
+    )
   );
 
   // --- Configurations (externalized parameters) ---------------------------

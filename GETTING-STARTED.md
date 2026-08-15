@@ -9,9 +9,9 @@ Use Claude (Desktop, Code, or Enterprise chat) to **monitor and manage SAP Cloud
 
 ## 0. What you're setting up
 
-An **MCP server** (Model Context Protocol) that wraps the SAP CPI OData v1 API as **42 tools**
-(monitoring, design content, deploy/undeploy, security material, + generic escape-hatch tools that
-reach the *entire* API). You run it two ways:
+An **MCP server** (Model Context Protocol) that wraps the SAP CPI OData v1 API as **48 tools**
+(monitoring, design content, flow authoring/deploy, security material, + generic escape-hatch
+tools that reach the *entire* API). You run it two ways:
 
 - **Local (stdio)** — runs on your PC, used by **Claude Desktop** or **Claude Code**. Easiest.
 - **Remote (HTTP + OAuth)** — deployed to **SAP BTP Cloud Foundry**, used by **Claude Enterprise
@@ -202,10 +202,13 @@ give your admin the endpoint URL and the OAuth client details from the service k
 
 ## Tool overview
 
+**Tenant discovery (1):** `list_cpi_tenants`.
 **Monitoring (8):** search/get MPLs, error info, headers, run steps, message store, failure summary, cancel.
-**Content (13):** package & flow CRUD, create flow, save-as-version, copy, download, configurations, resources.
+**Content (14):** package & flow CRUD, create flow, save-as-version, copy, download, push raw content, configurations, resources.
+**Flow authoring (1):** `build_integration_flow` — author + deploy real flow content from a step spec.
 **Runtime (6):** deployed list/status, deploy, undeploy, build status, endpoints.
 **Admin (12):** user/OAuth credentials, keystore, number ranges, data stores, variables, queues, partners, logs.
 **Generic (5):** `cpi_api_catalog`, `cpi_query`, `cpi_get_entity`, `cpi_invoke_function`, `cpi_write` — reach the whole API.
+**Where used (1):** `where_used` — search a word/value across flow content tenant-wide.
 
-Full reference: see `README.md`.
+**Total: 48 tools.** Full reference: see `README.md`.

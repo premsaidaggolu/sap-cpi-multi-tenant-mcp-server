@@ -1,8 +1,10 @@
 // Shared helpers for tool handlers.
-import { assertWriteAllowed, maskDeep, maskString } from "../cpiClient.js";
+import { z } from "zod";
+import { assertWriteAllowed, maskDeep, maskString, resolveTenant, listTenantNames } from "../cpiClient.js";
 import { hasScope } from "../requestScope.js";
+import { runWithTenant } from "../tenantScope.js";
 
-function permissionDenied(scope) {
+export function permissionDenied(scope) {
   return {
     isError: true,
     content: [
@@ -35,12 +37,21 @@ export function errorResult(err) {
  * Requires the 'mcp.read' scope — granted to every role (Support, Developer, Architect).
  * The returned function carries .requiredScope so registerScopedTool (below) can decide
  * whether to register the tool at all for the current caller, not just gate the call.
+ *
+ * Also resolves the caller's `tenant` argument (see registerScopedTool's auto-injected
+ * `tenant` field) to a registry entry and opens a tenantScope around the call, so every
+ * cpiGet/cpiRequest/cpiInvoke inside `fn` — however deeply nested — talks to the right
+ * CPI tenant. Pass { noTenant: true } for a tool that never touches the CPI API itself
+ * (currently just list_cpi_tenants, which is what a caller uses to *discover* the valid
+ * tenant names in the first place).
  */
-export function readHandler(fn) {
+export function readHandler(fn, opts = {}) {
   const wrapped = async (args) => {
     if (!hasScope("mcp.read")) return permissionDenied("mcp.read");
     try {
-      return jsonResult(await fn(args));
+      if (opts.noTenant) return jsonResult(await fn(args));
+      const tenant = resolveTenant(args && args.tenant);
+      return await runWithTenant(tenant, async () => jsonResult(await fn(args)));
     } catch (err) {
       return errorResult(err);
     }
@@ -69,34 +80,39 @@ export function writeHandler(fn, opts = {}) {
   const wrapped = async (args) => {
     if (!hasScope(requiredScope)) return permissionDenied(requiredScope);
     try {
-      assertWriteAllowed();
+      const tenant = resolveTenant(args && args.tenant);
+      return await runWithTenant(tenant, async () => {
+        // Inside the tenant scope: assertWriteAllowed checks THIS tenant's ALLOW_WRITE
+        // (with its own per-tenant override), not just the global flag.
+        assertWriteAllowed();
 
-      // Determine the action description and whether confirmation is required.
-      let describe = null;
-      let requireConfirm = true;
-      if (opts.action) {
-        describe = opts.action(args);
-      } else if (opts.destructive) {
-        describe = opts.destructive(args);
-        requireConfirm = describe != null; // destructive() may opt out by returning null
-      } else {
-        describe = "perform this write operation";
-      }
+        // Determine the action description and whether confirmation is required.
+        let describe = null;
+        let requireConfirm = true;
+        if (opts.action) {
+          describe = opts.action(args);
+        } else if (opts.destructive) {
+          describe = opts.destructive(args);
+          requireConfirm = describe != null; // destructive() may opt out by returning null
+        } else {
+          describe = "perform this write operation";
+        }
 
-      if (requireConfirm && args.confirm !== true) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `⚠️ Are you sure you want to ${describe}?\n` +
-                `This will change your SAP CPI tenant. No changes have been made yet.\n` +
-                `To proceed, run this tool again with confirm=true.`,
-            },
-          ],
-        };
-      }
-      return jsonResult(await fn(args));
+        if (requireConfirm && args.confirm !== true) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `⚠️ Are you sure you want to ${describe}${tenant ? ` on tenant "${tenant.name}"` : ""}?\n` +
+                  `This will change your SAP CPI tenant. No changes have been made yet.\n` +
+                  `To proceed, run this tool again with confirm=true.`,
+              },
+            ],
+          };
+        }
+        return jsonResult(await fn(args));
+      });
     } catch (err) {
       return errorResult(err);
     }
@@ -115,7 +131,30 @@ export function writeHandler(fn, opts = {}) {
  * the scope check inside readHandler/writeHandler only stops the tool from *running*
  * if called anyway (defense in depth), it doesn't hide it from the tool list on its own.
  */
-export function registerScopedTool(server, name, config, handler) {
+export function registerScopedTool(server, name, config, handler, opts = {}) {
   if (!hasScope(handler.requiredScope)) return;
-  server.registerTool(name, config, handler);
+
+  // Once 2+ CPI tenants are configured (see cpiClient.js's tenant registry), every
+  // tool that reaches the CPI API needs to know which one — add that as a required,
+  // fixed-choice argument so the MCP client sees exactly the configured names and has
+  // to ask the caller/user rather than guessing. opts.noTenantArg exempts the one tool
+  // (list_cpi_tenants) whose whole job is helping the caller discover those names.
+  const names = listTenantNames();
+  const finalConfig =
+    !opts.noTenantArg && names.length > 1
+      ? {
+          ...config,
+          inputSchema: {
+            tenant: z
+              .enum(names)
+              .describe(
+                `Which CPI tenant to use. Configured tenants: ${names.join(", ")}. ` +
+                  "Ask the user which one if it isn't already clear from context."
+              ),
+            ...config.inputSchema,
+          },
+        }
+      : config;
+
+  server.registerTool(name, finalConfig, handler);
 }

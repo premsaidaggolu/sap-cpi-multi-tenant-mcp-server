@@ -1,14 +1,172 @@
 // SAP Cloud Integration (CPI) OData client.
 // Handles OAuth2 client-credentials token retrieval (with caching) and
 // authenticated requests against the CPI OData v1 API (/api/v1).
+import { currentTenant } from "./tenantScope.js";
 
-// Read configuration from process.env at CALL TIME (not module-load time).
-// This matters because ES `import` statements execute before the .env loader
-// in index.js runs, so capturing these at module top would see empty values.
+// Every outbound fetch() in this file passes this as its `signal`. Node's fetch has no
+// default timeout — a stalled network hop (VPN drop, tenant unreachable, proxy hang)
+// would otherwise hang the awaiting call indefinitely, which from the MCP client's side
+// looks exactly like a crashed/unresponsive server (confirmed: this is what surfaced a
+// real hang report against build_integration_flow). CPI_REQUEST_TIMEOUT_MS overrides it.
+const REQUEST_TIMEOUT_MS = Number(process.env.CPI_REQUEST_TIMEOUT_MS) || 45_000;
+function requestTimeoutSignal() {
+  return AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+}
+
+// --- Tenant registry ---------------------------------------------------------
+// Multi-tenant config: CPI_BASE_URL<N> / CPI_TOKEN_URL<N> / CPI_CLIENT_ID<N> /
+// CPI_CLIENT_SECRET<N> (+ optional TENANT_NAME<N>, ALLOW_WRITE<N>, STATUS<N>) for as
+// many numeric suffixes as are present in the environment — add a 3rd/4th/Nth tenant
+// by adding a new numbered group of vars, no code change. Falls back to the legacy
+// unsuffixed vars (a single implicit tenant, no `tenant` tool argument needed at all)
+// when no numbered tenant is found, so existing single-tenant deployments/.env files
+// keep working unchanged.
+//
+// Built once and cached: like the rest of this server, picking up a new tenant added
+// to the environment needs a restart (same as any other env var change).
+let tenantRegistry = null;
+
+/** STATUS<N> is opt-in: unset/anything-but-"disable(d)" means enabled. */
+function isDisabledStatus(raw) {
+  return /^disabled?$/i.test(String(raw || "").trim());
+}
+
+function buildTenantRegistry() {
+  const suffixes = new Set();
+  const re = /^CPI_BASE_URL(\d+)$/;
+  for (const key of Object.keys(process.env)) {
+    const m = key.match(re);
+    if (m) suffixes.add(m[1]);
+  }
+
+  const list = [];
+  const incomplete = [];
+  const disabled = [];
+  for (const n of [...suffixes].sort((a, b) => Number(a) - Number(b))) {
+    const name = process.env[`TENANT_NAME${n}`] || `tenant${n}`;
+
+    // STATUS<N>=disable(d) keeps the credentials in the file but takes the tenant
+    // out of rotation entirely — not selectable, not counted towards multi-tenant
+    // mode, and never resolved even if a caller somehow names it.
+    if (isDisabledStatus(process.env[`STATUS${n}`])) {
+      disabled.push(`tenant #${n} (${name})`);
+      continue;
+    }
+
+    const baseUrl = process.env[`CPI_BASE_URL${n}`];
+    const tokenUrl = process.env[`CPI_TOKEN_URL${n}`];
+    const clientId = process.env[`CPI_CLIENT_ID${n}`];
+    const clientSecret = process.env[`CPI_CLIENT_SECRET${n}`];
+    const need = { CPI_BASE_URL: baseUrl, CPI_TOKEN_URL: tokenUrl, CPI_CLIENT_ID: clientId, CPI_CLIENT_SECRET: clientSecret };
+    const gaps = Object.entries(need).filter(([, v]) => !v).map(([k]) => `${k}${n}`);
+    if (gaps.length) {
+      incomplete.push(`tenant #${n} (${name}) is missing ${gaps.join(", ")}`);
+      continue;
+    }
+    const allowWriteRaw = process.env[`ALLOW_WRITE${n}`];
+    list.push({
+      id: n,
+      name,
+      baseUrl,
+      tokenUrl,
+      clientId,
+      clientSecret,
+      // Per-tenant override of the global ALLOW_WRITE flag — leave unset to inherit it
+      // (e.g. a Dev tenant can allow writes while Prod stays read-only under one flag).
+      allowWrite: allowWriteRaw !== undefined ? String(allowWriteRaw).toLowerCase() === "true" : undefined,
+    });
+  }
+
+  if (incomplete.length) {
+    console.warn(`[cpiClient] Skipping incomplete tenant config — ${incomplete.join("; ")}`);
+  }
+  if (disabled.length) {
+    // console.error, not console.log: on the stdio transport, stdout is reserved for
+    // JSON-RPC frames — anything else written there breaks the client's parser.
+    console.error(`[cpiClient] Skipping disabled tenant(s) — ${disabled.join(", ")}`);
+  }
+
+  // No numbered tenant found at all — legacy single-tenant mode off the plain vars.
+  let legacy = null;
+  if (list.length === 0 && process.env.CPI_BASE_URL) {
+    legacy = {
+      id: null,
+      name: process.env.TENANT_NAME || "default",
+      baseUrl: process.env.CPI_BASE_URL,
+      tokenUrl: process.env.CPI_TOKEN_URL,
+      clientId: process.env.CPI_CLIENT_ID,
+      clientSecret: process.env.CPI_CLIENT_SECRET,
+      allowWrite: undefined,
+    };
+  }
+
+  const byName = new Map();
+  for (const t of list) byName.set(t.name.toLowerCase(), t);
+
+  return { list, byName, legacy };
+}
+
+function getTenantRegistry() {
+  if (!tenantRegistry) tenantRegistry = buildTenantRegistry();
+  return tenantRegistry;
+}
+
+/** Tenant names available for the `tenant` tool argument (empty in single/legacy mode). */
+export function listTenantNames() {
+  return getTenantRegistry().list.map((t) => t.name);
+}
+
+/** True once 2+ numbered tenants are configured — the point at which callers must pick one. */
+export function isMultiTenant() {
+  return getTenantRegistry().list.length > 1;
+}
+
+/**
+ * Resolve a tenant by name (case-insensitive) to a registry entry for use with
+ * tenantScope.runWithTenant. In legacy/single-tenant setups `name` is ignored/optional.
+ * Throws (listing the valid names) on an unknown name so the caller — typically the AI
+ * client relaying a tool error — gets something actionable back.
+ */
+export function resolveTenant(name) {
+  const reg = getTenantRegistry();
+  if (reg.list.length === 0) return reg.legacy; // legacy single-tenant mode (or unconfigured)
+  if (reg.list.length === 1 && !name) return reg.list[0]; // one tenant configured -> default to it
+  const key = String(name || "").toLowerCase();
+  const found = reg.byName.get(key);
+  if (!found) {
+    const known = reg.list.map((t) => t.name).join(", ");
+    throw new Error(
+      `Unknown or missing tenant "${name || ""}". Configured tenants: ${known || "(none)"}. ` +
+        `Call list_cpi_tenants to see the current list.`
+    );
+  }
+  return found;
+}
+
+/** Cache key for the per-tenant token/CSRF caches below. */
+function tenantCacheKey() {
+  const t = currentTenant();
+  return t ? t.name : "__default__";
+}
+
+// Read configuration from the active tenant (see tenantScope.js), which
+// domains/helpers.js populates from the caller's `tenant` argument before any
+// cpiGet/cpiRequest/cpiInvoke call runs. Falls back to the plain env vars when no
+// tenant context is active at all (shouldn't happen via the tool layer, but keeps the
+// original "missing environment variables" error intact for a totally unconfigured server).
 function config() {
+  const t = currentTenant();
+  if (t) {
+    return {
+      CPI_BASE_URL: t.baseUrl,
+      CPI_TOKEN_URL: t.tokenUrl,
+      CPI_CLIENT_ID: t.clientId,
+      CPI_CLIENT_SECRET: t.clientSecret,
+    };
+  }
   return {
-    CPI_BASE_URL: process.env.CPI_BASE_URL, // https://<tenant>.../api/v1
-    CPI_TOKEN_URL: process.env.CPI_TOKEN_URL, // https://<subdomain>.../oauth/token
+    CPI_BASE_URL: process.env.CPI_BASE_URL,
+    CPI_TOKEN_URL: process.env.CPI_TOKEN_URL,
     CPI_CLIENT_ID: process.env.CPI_CLIENT_ID,
     CPI_CLIENT_SECRET: process.env.CPI_CLIENT_SECRET,
   };
@@ -22,17 +180,18 @@ function assertConfig() {
   if (missing.length) {
     throw new Error(
       `Missing required environment variables: ${missing.join(", ")}. ` +
-        `Copy .env.example and fill in your CPI service-key values.`
+        `Copy .env.example and fill in your CPI service-key values (CPI_BASE_URL1/2/... for ` +
+        `multiple tenants, or the plain CPI_BASE_URL for a single one).`
     );
   }
 }
 
 // --- Host masking ------------------------------------------------------------
-// Tool results (and error messages) must never expose the real CPI tenant
-// hostname to callers. Hosts are derived from env at call time so this works
-// for whatever tenant is configured — nothing tenant-specific is hardcoded.
+// Tool results (and error messages) must never expose a real CPI tenant hostname to
+// callers. Masks EVERY configured tenant's hosts, not just the one active for the
+// current call — belt-and-suspenders so a result assembled from mixed context (or a
+// bug) still can't leak a hostname for a *different* tenant than the one it names.
 function maskTargets() {
-  const cfg = config();
   const targets = [];
   const add = (raw, placeholder) => {
     if (!raw) return;
@@ -43,8 +202,12 @@ function maskTargets() {
       // Not a valid URL — nothing to mask.
     }
   };
-  add(cfg.CPI_BASE_URL, "<cpi-tenant-host>");
-  add(cfg.CPI_TOKEN_URL, "<cpi-auth-host>");
+  const reg = getTenantRegistry();
+  const tenants = reg.list.length ? reg.list : reg.legacy ? [reg.legacy] : [];
+  for (const t of tenants) {
+    add(t.baseUrl, "<cpi-tenant-host>");
+    add(t.tokenUrl, "<cpi-auth-host>");
+  }
   // Longest host first so overlapping hostnames don't get partially replaced.
   return targets.sort((a, b) => b.host.length - a.host.length);
 }
@@ -72,16 +235,20 @@ export function maskDeep(value) {
 }
 
 // --- Token cache -----------------------------------------------------------
-let cachedToken = null;
-let cachedTokenExpiry = 0; // epoch ms
+// Keyed by tenant name — a shared single slot would let tenant B's request reuse a
+// token minted for tenant A's client credentials, which is a cross-tenant leak, not
+// just a cache bug.
+const tokenCacheByTenant = new Map(); // name -> { token, expiry }
 
 async function getAccessToken() {
   assertConfig();
   const { CPI_TOKEN_URL, CPI_CLIENT_ID, CPI_CLIENT_SECRET } = config();
+  const key = tenantCacheKey();
   const now = Date.now();
   // Reuse token until 60s before expiry.
-  if (cachedToken && now < cachedTokenExpiry - 60_000) {
-    return cachedToken;
+  const cached = tokenCacheByTenant.get(key);
+  if (cached && now < cached.expiry - 60_000) {
+    return cached.token;
   }
 
   const basic = Buffer.from(`${CPI_CLIENT_ID}:${CPI_CLIENT_SECRET}`).toString("base64");
@@ -92,6 +259,7 @@ async function getAccessToken() {
       "Content-Type": "application/x-www-form-urlencoded",
     },
     body: "grant_type=client_credentials",
+    signal: requestTimeoutSignal(),
   });
 
   if (!res.ok) {
@@ -100,10 +268,9 @@ async function getAccessToken() {
   }
 
   const data = await res.json();
-  cachedToken = data.access_token;
   const expiresInSec = Number(data.expires_in) || 3600;
-  cachedTokenExpiry = now + expiresInSec * 1000;
-  return cachedToken;
+  tokenCacheByTenant.set(key, { token: data.access_token, expiry: now + expiresInSec * 1000 });
+  return data.access_token;
 }
 
 // --- Core request helper ---------------------------------------------------
@@ -145,6 +312,7 @@ export async function cpiGet(path, query = {}, opts = {}) {
             ? "text/plain, */*"
             : "application/json",
       },
+      signal: requestTimeoutSignal(),
     });
   };
 
@@ -195,26 +363,39 @@ export async function cpiGet(path, query = {}, opts = {}) {
 
 // --- Write guard -----------------------------------------------------------
 /**
- * Throw unless ALLOW_WRITE=true. Called by every create/update/delete/deploy tool.
+ * Throw unless writes are allowed for the active tenant. Called by every
+ * create/update/delete/deploy tool. A tenant-specific ALLOW_WRITE<N> (see the tenant
+ * registry above) overrides the global ALLOW_WRITE for that one tenant — e.g. a Dev
+ * tenant can allow writes while Prod stays read-only under the same server.
  */
 export function assertWriteAllowed() {
-  if (String(process.env.ALLOW_WRITE).toLowerCase() !== "true") {
+  const t = currentTenant();
+  const allowed =
+    t && t.allowWrite !== undefined
+      ? t.allowWrite
+      : String(process.env.ALLOW_WRITE).toLowerCase() === "true";
+  if (!allowed) {
     throw new Error(
-      "Write operations are disabled. Set ALLOW_WRITE=true in your .env (and restart the " +
-        "server) to enable deploy / create / update / delete tools."
+      `Write operations are disabled${t ? ` for tenant "${t.name}"` : ""}. Set ALLOW_WRITE=true ` +
+        `(or ALLOW_WRITE${t && t.id ? t.id : ""}=true for just this tenant) and restart the server ` +
+        `to enable deploy / create / update / delete tools.`
     );
   }
 }
 
 // --- CSRF token cache ------------------------------------------------------
 // CPI requires an X-CSRF-Token (fetched via a GET) plus its session cookie for
-// any modifying request (POST/PUT/DELETE and most function imports).
-let csrfCache = { token: null, cookies: null, at: 0 };
+// any modifying request (POST/PUT/DELETE and most function imports). Keyed by tenant
+// name for the same reason as the token cache above — tenant A's session cookie must
+// never be sent on a request meant for tenant B.
+const csrfCacheByTenant = new Map(); // name -> { token, cookies, at }
 
 async function getCsrf(token, force = false) {
+  const key = tenantCacheKey();
   const now = Date.now();
-  if (!force && csrfCache.token && now - csrfCache.at < 15 * 60 * 1000) {
-    return csrfCache;
+  const cached = csrfCacheByTenant.get(key);
+  if (!force && cached && now - cached.at < 15 * 60 * 1000) {
+    return cached;
   }
   const { CPI_BASE_URL } = config();
   const res = await fetch(`${CPI_BASE_URL}/`, {
@@ -224,14 +405,16 @@ async function getCsrf(token, force = false) {
       "X-CSRF-Token": "Fetch",
       Accept: "application/json",
     },
+    signal: requestTimeoutSignal(),
   });
   const setCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
-  csrfCache = {
+  const entry = {
     token: res.headers.get("x-csrf-token"),
     cookies: setCookies.map((c) => c.split(";")[0]).join("; "),
     at: now,
   };
-  return csrfCache;
+  csrfCacheByTenant.set(key, entry);
+  return entry;
 }
 
 // --- Modifying request helper (POST/PUT/DELETE) ----------------------------
@@ -271,7 +454,10 @@ export async function cpiRequest(method, path, opts = {}) {
     }
     const payload =
       body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body);
-    return fetch(buildUrl(), { method, headers, body: payload });
+    // A base64 zip upload (build_integration_flow's ArtifactContent PUT) is the one
+    // payload here big enough to need more headroom than a typical metadata call.
+    const timeoutMs = payload && payload.length > 200_000 ? REQUEST_TIMEOUT_MS * 3 : REQUEST_TIMEOUT_MS;
+    return fetch(buildUrl(), { method, headers, body: payload, signal: AbortSignal.timeout(timeoutMs) });
   };
 
   let csrf = await getCsrf(token);
@@ -286,15 +472,25 @@ export async function cpiRequest(method, path, opts = {}) {
   if (!res.ok && res.status !== 202) {
     throw new Error(`CPI ${method} ${path} failed (${res.status}): ${text.slice(0, 1500)}`);
   }
-  if (raw) return text;
-  if (!text) return { status: res.status, ok: true };
-  try {
-    const data = JSON.parse(text);
-    if (data && data.d !== undefined) return data.d.results !== undefined ? data.d.results : data.d;
-    return data;
-  } catch {
-    return { status: res.status, body: text };
+
+  let data;
+  if (raw) {
+    data = text;
+  } else if (!text) {
+    data = { status: res.status, ok: true };
+  } else {
+    try {
+      const parsed = JSON.parse(text);
+      data = parsed && parsed.d !== undefined ? (parsed.d.results !== undefined ? parsed.d.results : parsed.d) : parsed;
+    } catch {
+      data = { status: res.status, body: text };
+    }
   }
+
+  // opts.full: also surface status + the Location header, needed by callers that must
+  // extract an id CPI only hands back in a header (e.g. a deploy task id), not the body.
+  if (opts.full) return { data, status: res.status, location: res.headers.get("location") };
+  return data;
 }
 
 /**
@@ -304,13 +500,13 @@ export async function cpiRequest(method, path, opts = {}) {
  * @param {Object} [params]  Function parameters.
  * @param {"POST"|"GET"} [method]
  */
-export async function cpiInvoke(functionName, params = {}, method = "POST") {
+export async function cpiInvoke(functionName, params = {}, method = "POST", opts = {}) {
   const query = {};
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined || v === null || v === "") continue;
     query[k] = typeof v === "string" ? odataString(v) : v;
   }
-  return cpiRequest(method, `/${functionName}`, { query });
+  return cpiRequest(method, `/${functionName}`, { query, ...opts });
 }
 
 /**
