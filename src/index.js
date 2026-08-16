@@ -30,7 +30,7 @@ try {
   // No .env file — rely on real environment variables (e.g. on Cloud Foundry).
 }
 
-const SERVER_INFO = { name: "sap-cpi-mcp-server", version: "1.1.0" };
+const SERVER_INFO = { name: "sap-cpi-mcp-server", version: "1.2.0" };
 
 function buildServer() {
   const server = new McpServer(SERVER_INFO);

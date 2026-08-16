@@ -91,15 +91,60 @@ export function buildParametersFiles(declaredParams, usedPlaceholders) {
 export function injectFlowContent(shellIflwText, rendered) {
   let text = shellIflwText;
 
-  const processMatch = text.match(/<bpmn2:process\b([^>]*)>([\s\S]*?)<\/bpmn2:process>/);
-  if (!processMatch) throw new Error("Shell .iflw has no <bpmn2:process>...</bpmn2:process> — unexpected shape; can't inject content.");
-  const processExtMatch = processMatch[2].match(/<bpmn2:extensionElements>[\s\S]*?<\/bpmn2:extensionElements>/);
+  // Match ALL top-level <bpmn2:process> elements, not just the first, and replace the
+  // WHOLE span from the first through the last with freshly generated content.
+  // Confirmed live 2026-08-16: the previous version only ever found-and-replaced the
+  // FIRST process and blindly APPENDED new Local Integration Processes after it —
+  // across repeated pushes with reuseExistingShell:true, this accumulated STALE
+  // sibling processes the PREVIOUS push had already baked into the downloaded shell,
+  // never removing them. Symptom: the same Local Integration Process id (e.g.
+  // "LocalProcess_1") appearing 2-3+ times in one document, which CPI's validator
+  // reports as the confusing "Parent process cannot be assigned to the Process Call"
+  // (it can't tell which identically-id'd process is the real target) and can
+  // misattribute OTHER validation errors to unrelated elements as a side effect.
+  const processRe = /<bpmn2:process\b[^>]*>[\s\S]*?<\/bpmn2:process>/g;
+  const processMatches = [...text.matchAll(processRe)];
+  if (!processMatches.length) throw new Error("Shell .iflw has no <bpmn2:process>...</bpmn2:process> — unexpected shape; can't inject content.");
+  // Identify the MAIN process by EXCLUDING ids matching the "LocalProcess_N" pattern
+  // this generator itself always uses (see assembleIflow) — NOT by assuming it's
+  // processMatches[0]. Confirmed live 2026-08-16: on an already-stale accumulated
+  // shell, the stale Local Integration Process entries can end up ordered BEFORE the
+  // real main one (e.g. "LocalProcess_1, LocalProcess_1, LocalProcess_1, Process_1"),
+  // so "the first match" silently picked a stale local process as if it were the
+  // main one — its extensionElements got misused as the main process's own, and
+  // spliceCollaboration then looked for the wrong participant to keep, dropping the
+  // real "Integration Process" pool's shape entirely (rendered with no box at all).
+  const mainProcessMatch = processMatches.find((m) => {
+    const id = (m[0].match(/<bpmn2:process\s+id="([^"]+)"/) || [])[1];
+    return id && !/^LocalProcess_\d+$/.test(id);
+  });
+  if (!mainProcessMatch) {
+    throw new Error(
+      "Could not identify the main process among the shell's <bpmn2:process> elements (all matched the " +
+        "\"LocalProcess_N\" pattern) — the shell may be corrupted; consider deleting and recreating this artifact."
+    );
+  }
+  const firstProcessXml = mainProcessMatch[0];
+  const mainProcessId = (firstProcessXml.match(/<bpmn2:process\s+id="([^"]+)"/) || [])[1] || null;
+  const mainAttrs = (firstProcessXml.match(/<bpmn2:process\b([^>]*)>/) || [])[1] || "";
+  const processExtMatch = firstProcessXml.match(/<bpmn2:extensionElements>[\s\S]*?<\/bpmn2:extensionElements>/);
   const processExt = processExtMatch ? processExtMatch[0] : "";
-  text = text.replace(processMatch[0], `<bpmn2:process${processMatch[1]}>${processExt}${rendered.processInner}</bpmn2:process>`);
+
+  // Any Local Integration Processes (rendered.extraProcessesXml — see steps.js's
+  // assembleIflow) are SIBLING <bpmn2:process> elements, not nested inside the main
+  // one — appending them right after its closing tag lands them exactly where the
+  // confirmed reference structure has them (collaboration, then N processes, then the
+  // one shared BPMNDiagram/BPMNPlane).
+  const extraProcessesXml = (rendered.extraProcessesXml || []).join("");
+  const newProcessesBlock = `<bpmn2:process${mainAttrs}>${processExt}${rendered.processInner}</bpmn2:process>${extraProcessesXml}`;
+  const spanStart = processMatches[0].index;
+  const lastMatch = processMatches[processMatches.length - 1];
+  const spanEnd = lastMatch.index + lastMatch[0].length;
+  text = text.slice(0, spanStart) + newProcessesBlock + text.slice(spanEnd);
 
   const collabMatch = text.match(/<bpmn2:collaboration\b([^>]*)>([\s\S]*?)<\/bpmn2:collaboration>/);
   if (!collabMatch) throw new Error("Shell .iflw has no <bpmn2:collaboration>...</bpmn2:collaboration> — unexpected shape; can't inject content.");
-  const { collabInner: newCollabInner, processParticipantId } = spliceCollaboration(collabMatch[2], rendered.collaborationExtra);
+  const { collabInner: newCollabInner, processParticipantId } = spliceCollaboration(collabMatch[2], rendered.collaborationExtra, mainProcessId);
   text = text.replace(collabMatch[0], `<bpmn2:collaboration${collabMatch[1]}>${newCollabInner}</bpmn2:collaboration>`);
 
   const planeMatch = text.match(/<bpmndi:BPMNPlane\b([^>]*)>([\s\S]*?)<\/bpmndi:BPMNPlane>/);
@@ -117,12 +162,22 @@ export function injectFlowContent(shellIflwText, rendered) {
  * Process" participant from the shell (see the header note above on why the
  * default Sender/Receiver are dropped). Returns that participant's id too, so the
  * diagram splice above knows which original shape is the pool to keep (resized).
+ *
+ * `mainProcessId` pins down exactly WHICH participant is "the" Integration Process
+ * one — confirmed live 2026-08-16: matching "the first participant with any
+ * processRef=" (the old behavior) can pick a STALE Local Integration Process
+ * participant instead of the real main one, once one has been baked into a
+ * previously-pushed shell (see injectFlowContent's header note on the same root
+ * cause) — matching by the main process's own real id is unambiguous regardless of
+ * how many stale participants accumulated.
  */
-function spliceCollaboration(oldInner, extraXml) {
+function spliceCollaboration(oldInner, extraXml, mainProcessId) {
   const extMatch = oldInner.match(/<bpmn2:extensionElements>[\s\S]*?<\/bpmn2:extensionElements>/);
   const ext = extMatch ? extMatch[0] : "";
   const participantMatches = oldInner.match(/<bpmn2:participant\b[^>]*\/>|<bpmn2:participant\b[^>]*>[\s\S]*?<\/bpmn2:participant>/g) || [];
-  const processParticipant = participantMatches.find((p) => /processRef="/.test(p));
+  const processParticipant = mainProcessId
+    ? participantMatches.find((p) => p.includes(`processRef="${mainProcessId}"`))
+    : participantMatches.find((p) => /processRef="/.test(p));
   if (!processParticipant) {
     throw new Error(
       "Could not find the 'Integration Process' participant (a <bpmn2:participant processRef=\"...\"/>) in the " +

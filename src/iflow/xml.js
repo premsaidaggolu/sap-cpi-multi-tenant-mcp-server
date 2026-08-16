@@ -28,6 +28,32 @@ export function attrEscape(value) {
 }
 
 /**
+ * Map this codebase's camelCase authenticationMethod enum values (used across the
+ * zod schema for http/odata adapters) toward CPI's actual `authenticationMethod`
+ * ifl:property value. STATUS 2026-08-16: NOT a confirmed fix, still an open problem.
+ * The raw enum identifier "OAuth2ClientCredentials" fails ValidateIntegrationDesign
+ * timeArtifact with "Invalid value 'OAuth2 Client Credentials' entered in
+ * 'Authentication' field" — this was first misread as the error message revealing
+ * the correct value, so this mapping was added to space it out; re-tested live and
+ * the SAME error persists verbatim with the spaced value too. So neither
+ * "OAuth2ClientCredentials" nor "OAuth2 Client Credentials" is the value CPI's
+ * odata/HCIOData adapter actually wants for OAuth2 Client Credentials auth — the
+ * error text apparently just echoes back whatever was submitted rather than naming
+ * the expected one. Left in place since it's harmless (both single-word values pass
+ * through unchanged, and "ClientCertificate" is still untested either way), but do
+ * NOT treat OAuth2ClientCredentials as working for odata — use authenticationMethod:
+ * "None" (or "Basic", untested) until the real expected value is confirmed some
+ * other way (e.g. inspecting a hand-built OAuth2-configured channel in the web editor).
+ */
+const AUTH_METHOD_DISPLAY_VALUES = {
+  ClientCertificate: "Client Certificate",
+  OAuth2ClientCredentials: "OAuth2 Client Credentials",
+};
+export function authMethodValue(method) {
+  return AUTH_METHOD_DISPLAY_VALUES[method] || method;
+}
+
+/**
  * CPI's "row-XML" mini-format, used for scheduleKey / propertyTable / headerTable /
  * attachments. Builds the *raw* inner text (real `<row>`/`<cell>` characters) — the
  * caller wraps it in an ifl:property <value> element, which runs it through
@@ -126,6 +152,103 @@ export function findPlaceholders(text) {
   return found;
 }
 
+// --- Lightweight, dependency-free XML well-formedness check -----------------
+// Added 2026-08-16 after hitting real generated-content bugs this catches for free:
+// a base64-relay corruption that merged two properties into one malformed tag (a
+// dropped "key>" leaving a stray "<" in a <value> text node), and a duplicate element
+// `id` across two <bpmn2:process> siblings (well-formed XML, but breaks CPI — a
+// Process Call step can't tell its target apart from its own parent process). No npm
+// XML parser is available here (no network to install one — see this file's own
+// header and steps.js's layout.js comment on the same constraint), so this is a
+// hand-rolled, best-effort scanner: a stack-based tag matcher plus an `id`-attribute
+// tracker, NOT a spec-compliant parser (no DTD/general-entity resolution, no
+// namespace validation). It's enough to catch the failure classes actually observed,
+// which is the bar that matters here — run this on every generated fragment BEFORE
+// it's ever spliced into a shell or pushed to a tenant.
+
+const XML_TOKEN_RE =
+  /<(\/?)([A-Za-z_][\w.:-]*)((?:\s+[A-Za-z_][\w.:-]*\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>|<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[[\s\S]*?\]\]>/g;
+
+/**
+ * Validate one self-contained XML fragment (must itself be well-nested — e.g. one
+ * <bpmn2:process>...</bpmn2:process>, or a flat sequence of complete sibling
+ * elements like this generator's `processInner`/`diagramInner`). `seenIds` is an
+ * optional shared Map (id -> "label:tagName" of first sighting) so duplicate-id
+ * detection can span multiple fragments that will end up in the same document —
+ * pass the same Map across calls for processInner/collaborationExtra/diagramInner/
+ * each extraProcessesXml entry to catch cross-fragment collisions.
+ */
+export function validateXmlFragment(xml, label = "fragment", seenIds = new Map()) {
+  const errors = [];
+  const stack = [];
+  let lastIndex = 0;
+  let match;
+  XML_TOKEN_RE.lastIndex = 0;
+  while ((match = XML_TOKEN_RE.exec(xml))) {
+    const between = xml.slice(lastIndex, match.index);
+    const strayLt = between.indexOf("<");
+    if (strayLt !== -1) {
+      errors.push(
+        `${label}: unescaped "<" in text content at offset ${lastIndex + strayLt} — not part of any recognized ` +
+          `tag/comment/CDATA (the classic signature of a dropped "key>"/"value>" merging two properties into one).`
+      );
+    }
+    lastIndex = XML_TOKEN_RE.lastIndex;
+
+    const full = match[0];
+    if (full.startsWith("<!--") || full.startsWith("<?") || full.startsWith("<![CDATA[")) continue;
+    const [, closingSlash, tagName, attrs, selfClosingSlash] = match;
+
+    if (closingSlash) {
+      const top = stack.pop();
+      if (!top || top.name !== tagName) {
+        errors.push(`${label}: mismatched closing tag </${tagName}> at offset ${match.index} — expected </${top ? top.name : "(nothing open)"}>.`);
+        if (top) stack.push(top); // keep scanning for further errors instead of bailing out
+      }
+    } else {
+      const idMatch = attrs.match(/\bid\s*=\s*"([^"]*)"|\bid\s*=\s*'([^']*)'/);
+      const id = idMatch ? idMatch[1] ?? idMatch[2] : null;
+      if (id) {
+        const sighting = `${label}:${tagName}`;
+        if (seenIds.has(id)) {
+          errors.push(
+            `Duplicate element id "${id}" — first seen as ${seenIds.get(id)}, again as ${sighting} at offset ${match.index}. ` +
+              `Two elements sharing an id is well-formed XML but breaks CPI (e.g. a Process Call can't tell its ` +
+              `target apart from its own parent process).`
+          );
+        } else {
+          seenIds.set(id, sighting);
+        }
+      }
+      if (!selfClosingSlash) stack.push({ name: tagName, at: match.index });
+    }
+  }
+  const trailing = xml.slice(lastIndex);
+  if (trailing.indexOf("<") !== -1) {
+    errors.push(`${label}: unescaped "<" in trailing text content after the last recognized tag.`);
+  }
+  for (const unclosed of stack) {
+    errors.push(`${label}: unclosed tag <${unclosed.name}> opened at offset ${unclosed.at}.`);
+  }
+  return errors;
+}
+
+/**
+ * Validate everything assembleIflow (steps.js) produces, sharing one `seenIds` map
+ * across all fragments so a duplicate id between (say) the main process and a Local
+ * Integration Process is caught even though each fragment is well-formed on its own.
+ */
+export function validateAssembledIflow(rendered) {
+  const seenIds = new Map();
+  const errors = [
+    ...validateXmlFragment(rendered.processInner, "processInner", seenIds),
+    ...validateXmlFragment(rendered.collaborationExtra, "collaborationExtra", seenIds),
+    ...validateXmlFragment(rendered.diagramInner, "diagramInner", seenIds),
+    ...(rendered.extraProcessesXml || []).flatMap((xml, i) => validateXmlFragment(xml, `extraProcessesXml[${i}]`, seenIds)),
+  ];
+  return { valid: errors.length === 0, errors };
+}
+
 /**
  * Confirmed exact shape of the Timer Start Event's `scheduleKey` blob (cron mode
  * only — the only trigger mode confirmed here). `cronFields` is the 7 CPI cron
@@ -139,7 +262,7 @@ const KNOWN_TZ_LABELS = {
   UTC: "( UTC 0:00 ) Greenwich Mean Time(Etc/GMT)",
 };
 
-export function buildTimerScheduleKey(cronFields, timezone = "Etc/GMT") {
+export function buildTimerScheduleKey(cronFields, timezone = "Etc/GMT", throwExceptionOnExpiry = true) {
   if (!Array.isArray(cronFields) || cronFields.length !== 7) {
     throw new Error(
       "Timer cron needs exactly 7 fields: second minute hour day_of_month month dayOfWeek year " +
@@ -166,7 +289,7 @@ export function buildTimerScheduleKey(cronFields, timezone = "Etc/GMT") {
     ["minutesValue", "0"],
     ["timeType", "ON_TIME"],
     ["timeZone", tzLabel || `(${timezone})`],
-    ["throwExceptionOnExpiry", "true"],
+    ["throwExceptionOnExpiry", throwExceptionOnExpiry ? "true" : "false"],
     ["second", second],
     ["minute", minute],
     ["hour", hour],

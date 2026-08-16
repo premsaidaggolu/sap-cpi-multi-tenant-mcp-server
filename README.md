@@ -1,6 +1,6 @@
 # SAP CPI MCP Server
 
-**Version 1.1.0**
+**Version 1.2.0**
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an MCP client
 (Claude Desktop, Claude Code, etc.) **monitor and manage SAP Cloud Integration (CPI / Integration
@@ -82,11 +82,11 @@ the tool doesn't just report failure: the `challenge` field explains what happen
 points you at `download_integration_flow(artifactId)` to fetch the already-pushed
 content back for inspection (SAP's OData API famously returns no detail for a build
 failure; the zip, imported into the web editor's Problems tab, is the reliable way to
-see the real error). Nothing is written to this server's local disk on that path —
-once content is pushed, the tenant itself is the copy of record. Pass `offline: true`
-to skip the tenant entirely and just generate a preview zip locally in
-`generated-iflows/` — that's the one mode where a local file is the only copy that
-will ever exist.
+see the real error). This tool never writes to this server's local disk, in any mode,
+on either transport (local stdio or the Cloud Foundry HTTP deployment) — once content
+is pushed, the tenant itself is the copy of record. Pass `offline: true` to skip the
+tenant entirely and get a preview zip back inline as base64 (`zipBase64` in the
+result) instead of a real push — decode it yourself locally if you want a file.
 
 ### Runtime & deployment
 | Tool | Purpose |
@@ -433,14 +433,22 @@ Requires **Node.js 18+** (uses the built-in `fetch`).
 
 ## Changelog
 
+### 1.2.0
+- `build_integration_flow` no longer writes anything to this server's local disk in
+  ANY mode, on either transport (local stdio or the Cloud Foundry HTTP deployment).
+  `offline: true` now returns its preview zip inline as `zipBase64` instead of saving
+  it to a `generated-iflows/` folder — that folder and the save-to-disk logic behind
+  it are gone entirely. Decode `zipBase64` yourself locally if you want an actual file.
+- `push_integration_flow_content`'s `zipFilePath` argument still exists (for a zip you
+  place on the server's filesystem some other way), but no longer assumes
+  `build_integration_flow` is what put it there.
+
 ### 1.1.0
-- `build_integration_flow` no longer writes a copy of pushed content to
+- `build_integration_flow` no longer writes a copy of pushed (online) content to
   `generated-iflows/` on this server's local disk. Once content is pushed to a tenant,
   the tenant is the copy of record — `download_integration_flow(artifactId)` fetches it
   back any time it's needed (e.g. to inspect a build failure in the web editor's
-  Problems tab). The one exception is `offline: true`, which never touches a tenant at
-  all, so its preview zip is still saved locally (that's the only copy that will ever
-  exist).
+  Problems tab).
 - Corrected the tool count (48, not 46/45/42 as previously stated in various docs).
 
 ### 1.0.0

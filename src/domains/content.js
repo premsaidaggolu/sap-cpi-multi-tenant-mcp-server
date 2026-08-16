@@ -151,11 +151,11 @@ export function registerContentTools(server) {
       title: "Push Raw Integration Flow Content (zip)",
       description:
         "Overwrite an EXISTING integration flow's content with a raw zip you already have — e.g. one downloaded " +
-        "via download_integration_flow and hand-edited locally, or one build_integration_flow generated in " +
-        "offline mode (its zipFilePath — an online build never leaves a local file, since the content is already " +
-        "on the tenant). Just replaces ArtifactContent as-is; doesn't touch the manifest/shell, and doesn't create " +
-        "the artifact if it doesn't exist yet (use create_integration_flow or build_integration_flow for that). " +
-        "Requires ALLOW_WRITE.",
+        "via download_integration_flow and hand-edited locally, or one you've placed on this server's filesystem " +
+        "yourself (build_integration_flow itself never writes a file here — its offline mode returns zipBase64 " +
+        "inline instead). Just replaces ArtifactContent as-is; doesn't touch the manifest/shell, and doesn't " +
+        "create the artifact if it doesn't exist yet (use create_integration_flow or build_integration_flow for " +
+        "that). Requires ALLOW_WRITE.",
       inputSchema: {
         artifactId: z.string(),
         version: z.string().default("active"),
@@ -164,10 +164,11 @@ export function registerContentTools(server) {
           .string()
           .optional()
           .describe(
-            "Absolute path to a zip file already on THIS SERVER's filesystem (e.g. an offline " +
-              "build_integration_flow's zipFilePath). Preferred over zipBase64 — reads the bytes directly server-" +
-              "side instead of round-tripping a large base64 blob through the caller, which is itself a real " +
-              "corruption risk for anything past a few KB. Exactly one of zipFilePath/zipBase64 is required."
+            "Absolute path to a zip file already on THIS SERVER's filesystem, if one happens to be sitting there " +
+              "(no tool here creates one automatically anymore). Preferred over zipBase64 when it applies — reads " +
+              "the bytes directly server-side instead of round-tripping a large base64 blob through the caller, " +
+              "which is itself a real corruption risk for anything past a few KB. Exactly one of zipFilePath/" +
+              "zipBase64 is required."
           ),
         zipBase64: z.string().optional().describe("Base64-encoded zip content, for when the caller only has it in memory. Exactly one of zipFilePath/zipBase64 is required."),
         confirm: z.boolean().optional().describe("Must be true to proceed."),
@@ -275,6 +276,29 @@ export function registerContentTools(server) {
           body: { Name: name, Id: id, PackageId: packageId, Description: description || "" },
         }),
       { action: ({ id, packageId }) => `create integration flow '${id}' in package '${packageId}'` }
+    )
+  );
+
+  // --- Delete integration flow ---------------------------------------------
+  registerScopedTool(server,
+    "delete_integration_flow",
+    {
+      title: "Delete Integration Flow",
+      description:
+        "Delete a single integration flow design-time artifact — unlike delete_integration_package, this leaves " +
+        "every OTHER artifact in the same package untouched. Requires ALLOW_WRITE and confirm=true. If the " +
+        "artifact is currently deployed, undeploy_artifact it first — deleting design-time content does not stop " +
+        "a running runtime artifact.",
+      inputSchema: {
+        artifactId: z.string(),
+        version: z.string().default("active"),
+        confirm: z.boolean().optional().describe("Must be true to proceed."),
+      },
+    },
+    writeHandler(
+      ({ artifactId, version }) =>
+        cpiRequest("DELETE", `/IntegrationDesigntimeArtifacts(Id=${odataString(artifactId)},Version=${odataString(version)})`),
+      { destructive: ({ artifactId, version }) => `permanently delete integration flow '${artifactId}' (version ${version})` }
     )
   );
 

@@ -5,11 +5,14 @@
 // splices it into a real tenant-generated shell, pushes it, deploys it, polls the
 // build/deploy status, and — on any challenge (build failure, timeout, runtime
 // start error) — says so plainly instead of leaving the caller stuck with an
-// opaque error. Once content is pushed, the tenant itself is the source of truth
-// for it — nothing is written to local disk on that path; download_integration_flow
-// fetches it back any time it's needed for inspection. The one exception is
-// offline:true, which never touches a tenant at all, so its preview zip is the
-// only copy that will ever exist and is saved to generated-iflows/ for that reason.
+// opaque error. This tool NEVER writes to this server's local disk, in any mode,
+// on either transport (stdio or the Cloud Foundry HTTP deployment): once content
+// is pushed, the tenant itself is the source of truth for it —
+// download_integration_flow fetches it back any time it's needed for inspection.
+// offline:true never touches a tenant at all, so its preview zip is instead
+// returned inline as zipBase64 in the tool result — the caller decodes it
+// locally (or on their own machine) if they want a file, this server doesn't
+// keep one.
 //
 // This is the encoded version of that skill: every XML shape, gotcha, and
 // auto-fix (== -> =, quoting comparison RHS, the whitespace-in-participant-name
@@ -18,18 +21,14 @@
 // guessed" ground rule everything here follows.
 import { z } from "zod";
 import JSZip from "jszip";
-import { mkdir, writeFile } from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { cpiGet, cpiRequest, cpiInvoke, odataString, assertWriteAllowed, resolveTenant } from "../cpiClient.js";
 import { jsonResult, errorResult, permissionDenied, registerScopedTool } from "./helpers.js";
 import { hasScope } from "../requestScope.js";
 import { runWithTenant } from "../tenantScope.js";
-import { buildFlowGraph, renderFlowGraph, SUPPORTED_KINDS, START_KINDS } from "../iflow/steps.js";
-import { sanitizeTechnicalId, findPlaceholders } from "../iflow/xml.js";
+import { assembleIflow, SUPPORTED_KINDS, START_KINDS } from "../iflow/steps.js";
+import { sanitizeTechnicalId, findPlaceholders, validateAssembledIflow } from "../iflow/xml.js";
 import { buildParametersFiles, injectFlowContent, buildOfflineShellIflw, offlineProjectXml, offlineManifest } from "../iflow/packageFiles.js";
 
-const OUTPUT_DIR = fileURLToPath(new URL("../../generated-iflows/", import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // --- zod step schema ----------------------------------------------------------
@@ -59,6 +58,7 @@ const StepSchema = z.lazy(() =>
         ),
       scheduleParam: z.string().optional().describe("Externalize the whole schedule as {{ParamName}} instead of a fixed cron."),
       timezone: z.string().default("Etc/GMT").describe('Only "Etc/GMT"/"UTC" have a confirmed display label; others still work but flag a warning.'),
+      throwExceptionOnExpiry: z.boolean().default(true).describe("Whether a missed/expired trigger raises an exception. true is CPI's own confirmed default; set false to have a missed run be silently skipped instead."),
     }),
     z.object({
       kind: z.literal("httpsStart"),
@@ -69,6 +69,35 @@ const StepSchema = z.lazy(() =>
         userRole: z.string().default("ESBMessaging.send").describe("Required when senderAuthType is RoleBased."),
       }),
     }).describe("Alternative to 'timer' as the first step — webhook/inbound-HTTPS-triggered flow instead of a schedule."),
+    z.object({
+      kind: z.literal("sftpStart"),
+      name: z.string(),
+      adapter: z.object({
+        host: z.string().describe("host:port in one field, e.g. sftp.partner.com:22."),
+        path: z.string().describe("Directory to poll."),
+        fileName: z.string().default("*"),
+        authentication: z.enum(["public_key", "user_password"]).default("user_password"),
+        credentialName: z.string().optional().describe("Required when authentication is user_password."),
+        privateKeyAlias: z.string().optional().describe("Required when authentication is public_key."),
+        username: z.string().optional(),
+        postProcessing: z.enum(["move", "delete", "test"]).default("move").describe('What happens to a file after pickup: "move" to archivePath, "delete" it, or "test" (leave it untouched).'),
+        archivePath: z.string().default(".archive").describe('Used when postProcessing is "move".'),
+        doneFileName: z.string().default("${file:name}.done"),
+        cron: z
+          .string()
+          .optional()
+          .describe('7-field CPI cron for the poll interval, same format as the timer step\'s "cron". Defaults to every 10 minutes.'),
+        timezone: z.string().default("Etc/GMT"),
+      }),
+    }).describe(
+      "Alternative to 'timer'/'httpsStart' as the first step — flow triggered by files landing in an SFTP " +
+        "directory (the polling side; CPI still calls it \"Sender\"). Confirmed real property names from " +
+        "AI_Agent_Reference_IFlow (2026-08-16) — reuses the timer step's confirmed cron scheduleKey shape for the " +
+        "poll interval, which is a reasonable but NOT independently confirmed extrapolation across adapter types " +
+        "(the underlying schedule1 cron string is identical either way; only the cosmetic Configure-tab display " +
+        "fields might render differently). Verify the Schedule tab looks sensible in the web editor before relying " +
+        "on this. To poll SFTP MID-flow instead of triggering the flow, use kind:\"pollEnrich\"/type:\"sftpPoll\"."
+    ),
     z.object({
       kind: z.literal("contentModifier"),
       name: z.string(),
@@ -146,7 +175,11 @@ const StepSchema = z.lazy(() =>
         }).describe(
           "OData V2 receiver (ComponentType HCIOData) — use this, not type:\"http\", for any OData call needing " +
             "real authentication. Adapted from a community reference (github.com/achgithub/mcp-cpi-tools), not yet " +
-            "independently confirmed against a live deploy here — verify in the web editor's Problems tab first."
+            "independently confirmed against a live deploy here — verify in the web editor's Problems tab first. " +
+            "authenticationMethod:\"OAuth2ClientCredentials\" is CONFIRMED BROKEN live 2026-08-16 — CPI rejects it " +
+            "with \"Invalid value 'OAuth2 Client Credentials' entered in 'Authentication' field\" regardless of " +
+            "whether the camelCase enum identifier or a space-separated label is sent; the real expected value " +
+            "isn't known yet. Use authenticationMethod:\"None\" (confirmed) until this is resolved."
         ),
         z.object({
           type: z.literal("sftpWrite"),
@@ -169,6 +202,30 @@ const StepSchema = z.lazy(() =>
           queueName: z.string(),
           expirationPeriodSec: z.number().int().default(30).describe("How long a message may sit on the queue before expiring, in seconds. Required by CPI — confirmed live 2026-08-14 that omitting it fails validation with 'Specify an expiration period'."),
         }).describe("JMS receiver — write to a queue. Confirmed live 2026-08-15 (fixed a missing 'direction' property plus several others this tool omitted)."),
+        z.object({
+          type: z.literal("soap"),
+          address: z.string().describe("SOAP endpoint URL."),
+          soapWsdlURL: z.string().optional().describe("Required if soapServiceName/soapWsdlPortName/operationName are set — CPI rejects those without a WSDL URL."),
+          soapServiceName: z.string().optional(),
+          soapWsdlPortName: z.string().optional(),
+          operationName: z.string().optional(),
+          credentialName: z.string().optional(),
+        }).describe(
+          "Plain SOAP 1.x receiver. ONLY valid as kind:\"send\", NOT kind:\"requestReply\" — confirmed live " +
+            "2026-08-16 (iterated against a real tenant's validator); this tool now refuses the requestReply " +
+            "combination outright. Setting soapServiceName/soapWsdlPortName/operationName without soapWsdlURL is " +
+            "also confirmed rejected by CPI (\"Port Name or Service Name cannot be defined without a WSDL\")."
+        ),
+        z.object({
+          type: z.literal("processDirect"),
+          address: z.string().describe("Internal path, e.g. /my-sub-flow — calls another iFlow directly without exposing HTTP externally."),
+        }).describe(
+          "ProcessDirect — internal iFlow-to-iFlow call. Confirmed real (non-placeholder) values from " +
+            "AI_Agent_Reference_IFlow (2026-08-16); the simplest adapter to configure of the set. ONLY valid as " +
+            "kind:\"requestReply\", NOT kind:\"send\" — confirmed live (2026-08-16): CPI's validator rejects it " +
+            "under Send with \"<name> is not supported for the adapter\"; this tool now refuses that combination " +
+            "outright before ever pushing to the tenant."
+        ),
       ]),
     }),
     z.object({
@@ -194,6 +251,93 @@ const StepSchema = z.lazy(() =>
       "Confirmed live (2026-08-14): the ONLY way to poll SFTP mid-flow. The polled file is left untouched " +
         "(noop:\"test\") — follow up with a kind:\"send\"/type:\"sftpWrite\" step if the flow needs to move it."
     ),
+    z.object({
+      kind: z.literal("filter"),
+      name: z.string(),
+      xpath: z.string().describe("XPath/expression selecting the nodes to keep, e.g. \"/node/function[field='123']\"."),
+      xpathType: z.enum(["Nodelist", "Value"]).default("Nodelist"),
+    }).describe("Message Filter. Confirmed real property shape from AI_Agent_Reference_IFlow (2026-08-16)."),
+    z.object({
+      kind: z.literal("xmlModifier"),
+      name: z.string(),
+      removeExternalDTDs: z.boolean().default(true),
+      removeXmlDeclaration: z.boolean().default(true),
+      xmlCharacterHandling: z.string().default("substitute").describe('Only "substitute" is a confirmed real value.'),
+    }).describe("XML Modifier. Confirmed real property shape from AI_Agent_Reference_IFlow (2026-08-16)."),
+    z.object({
+      kind: z.literal("writeVariables"),
+      name: z.string(),
+      visibility: z.enum(["global", "local"]).default("local"),
+      encrypt: z.boolean().default(true),
+      expireMinutes: z.number().int().default(90),
+      variables: z
+        .array(
+          z.object({
+            name: z.string(),
+            type: z.enum(["constant", "expression"]).default("constant"),
+            value: z.string().describe('Literal value (type: constant) or Camel Simple expression (type: expression), e.g. "${date:now:yyyy-MM-dd HH:mm:ss}".'),
+            scope: z.enum(["global", "local"]).default("local"),
+          })
+        )
+        .min(1),
+    }).describe("Write Variables step. Confirmed real row-XML shape from AI_Agent_Reference_IFlow (2026-08-16)."),
+    z.object({
+      kind: z.literal("splitter"),
+      name: z.string(),
+      splitExpression: z.string().describe('XPath selecting the elements to split on, e.g. "/root/row". Only XPath-mode General Splitter is confirmed — other split modes (line, fixed-length, ...) are not.'),
+      parallelProcessing: z.boolean().default(true),
+      threads: z.number().int().default(10),
+      stopOnException: z.boolean().default(true),
+      streaming: z.boolean().default(true),
+      timeoutSec: z.number().int().default(300),
+    }).describe("General Splitter (XPath mode). Confirmed real property shape from AI_Agent_Reference_IFlow (2026-08-16). Pair with a downstream 'gather' step to re-aggregate."),
+    z.object({
+      kind: z.literal("gather"),
+      name: z.string(),
+      messageType: z.string().default("DiffXMLFormat"),
+      aggregationAlgorithm: z.string().default("sap-pi-multi-mapping"),
+      targetXPath: z.string().optional(),
+      sourceXPath: z.string().optional(),
+    }).describe("Aggregator — collects the parallel results of a preceding 'splitter' step back into one message. Confirmed real property shape from AI_Agent_Reference_IFlow (2026-08-16)."),
+    z.object({
+      kind: z.literal("dataStoreGet"),
+      name: z.string(),
+      storageName: z.string().describe("Data Store name — create it first via create_data_store or the web UI."),
+      visibility: z.enum(["global", "local"]).default("global"),
+      deleteAfterRead: z.boolean().default(false),
+      stopOnMissingEntry: z.boolean().default(true),
+    }).describe("Data Store Get. Confirmed real property shape from AI_Agent_Reference_IFlow (2026-08-16)."),
+    z.object({
+      kind: z.literal("dataStorePut"),
+      name: z.string(),
+      storageName: z.string().describe("Data Store name — create it first via create_data_store or the web UI."),
+      visibility: z.enum(["global", "local"]).default("global"),
+      encrypt: z.boolean().default(true),
+      expireDays: z.number().int().default(30),
+      overrideExisting: z.boolean().default(true),
+      includeMessageHeaders: z.boolean().default(false),
+      alertThreshold: z.number().int().default(2),
+    }).describe("Data Store Write/Put. Confirmed real property shape from AI_Agent_Reference_IFlow (2026-08-16)."),
+    z.object({
+      kind: z.literal("dataStoreSelect"),
+      name: z.string(),
+      storageName: z.string().describe("Data Store name — create it first via create_data_store or the web UI."),
+      visibility: z.enum(["global", "local"]).default("global"),
+      maxResults: z.number().int().default(9999),
+      deleteAfterRead: z.boolean().default(false),
+    }).describe("Data Store Select (query multiple entries). Confirmed real property shape from AI_Agent_Reference_IFlow (2026-08-16)."),
+    z.object({
+      kind: z.literal("dataStoreDelete"),
+      name: z.string(),
+      storageName: z.string().describe("Data Store name — create it first via create_data_store or the web UI."),
+      visibility: z.enum(["global", "local"]).default("global"),
+      messageId: z.string().optional().describe("Delete one specific entry by message id; omit to leave deletion to the retention/expiry policy instead."),
+    }).describe("Data Store Delete. Confirmed real property shape from AI_Agent_Reference_IFlow (2026-08-16)."),
+    z.object({
+      kind: z.literal("processCall"),
+      name: z.string(),
+      processId: z.string().describe('The "id" of a Local Integration Process declared in the top-level "localProcesses" array (NOT the final generated element id — this tool resolves that mapping for you).'),
+    }).describe("Synchronously calls a reusable Local Integration Process. Confirmed real property shape from AI_Agent_Reference_IFlow (2026-08-16)."),
     z.object({ kind: z.literal("endEvent"), name: z.string().default("End") }),
   ])
 );
@@ -206,15 +350,42 @@ const ParameterSchema = z.object({
   description: z.string().optional(),
 });
 
-// --- small local helpers -------------------------------------------------------
-
-async function saveZip(buf, baseName) {
-  await mkdir(OUTPUT_DIR, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const file = path.join(OUTPUT_DIR, `${baseName}-${stamp}.zip`);
-  await writeFile(file, buf);
-  return file;
+// Global error handling — confirmed real structure (StartErrorEvent -> ... ->
+// EndErrorEvent/MessageEndEvent) from AI_Agent_Reference_IFlow (2026-08-16). ON BY
+// DEFAULT (the default `{}` still generates a minimal pass-through subprocess) since a
+// real CPI flow should always have one — pass `false` to omit it entirely.
+// ALWAYS defaults to endKind:"message" (Error Start Event -> ... -> Message End
+// Event) for BOTH the main flow and every Local Integration Process — a deliberate,
+// always-on convention (per user guidance), not conditional on process type.
+// endKind:"error" (Error End Event) is still supported and confirmed real too, but
+// opt-in only.
+function exceptionSubprocessSchema() {
+  return z
+    .union([
+      z.literal(false),
+      z.object({
+        name: z.string().optional(),
+        steps: z
+          .array(StepSchema)
+          .optional()
+          .describe(
+            "Error-handling logic (e.g. contentModifier/groovyScript/dataStore*/mail-via-'send' is NOT supported " +
+              "here — see the restriction note below). Runs between the Error Start Event and the terminal end " +
+              "event; omit for a minimal pass-through subprocess."
+          ),
+        endKind: z.enum(["message", "error"]).default("message").describe('"message" (default, always-on convention) = normal Message End Event; "error" = dedicated Error End Event, opt-in only.'),
+      }),
+    ])
+    .default({})
+    .describe(
+      "Exception Subprocess. Step kinds needing their own collaboration participant/adapter — timer, httpsStart, " +
+        "sftpStart, requestReply, send, pollEnrich — are refused inside it (diagram-shape handling for a " +
+        "subprocess-nested adapter isn't confirmed); use contentModifier/groovyScript/filter/writeVariables/" +
+        "dataStore*/processCall/router instead."
+    );
 }
+
+// --- small local helpers -------------------------------------------------------
 
 async function assembleOfflineZip({ id, name, iflw, prop, propdef, scripts }) {
   const zip = new JSZip();
@@ -436,9 +607,32 @@ export function registerIflowBuilderTools(server) {
         "property is always set to match its own participant name (a mismatch there — confirmed live 2026-08-14 — " +
         "produces an opaque 'Enter adapter details for channel' error with no other symptom, so this isn't caller-" +
         "configurable). requestReply/send adapters: http (auth 'None' only — use 'odata' for real auth), mail, " +
-        "odata (OData V2 / HCIOData, supports Basic/OAuth2ClientCredentials/ClientCertificate), sftpWrite (write/" +
-        "move a file), jms (confirmed live 2026-08-15 — needs expirationPeriodSec, defaults to 30). pollEnrich " +
-        "adapters: sftpPoll (the only way to poll SFTP mid-flow). " +
+        "odata (OData V2 / HCIOData — authenticationMethod:\"OAuth2ClientCredentials\" confirmed BROKEN live " +
+        "2026-08-16, CPI rejects it regardless of casing/spacing; use \"None\" or \"Basic\" until resolved), sftpWrite (write/" +
+        "move a file), jms (confirmed live 2026-08-15 — needs expirationPeriodSec, defaults to 30), soap (send " +
+        "ONLY, confirmed live 2026-08-16 — needs soapWsdlURL if soapServiceName/soapWsdlPortName/operationName " +
+        "are set, also confirmed live), processDirect (internal iFlow-to-iFlow call, requestReply ONLY — confirmed " +
+        "live 2026-08-16 that kind:\"send\" is rejected; this tool refuses both wrong-kind combinations before pushing). " +
+        "pollEnrich adapters: sftpPoll (the only " +
+        "way to poll SFTP mid-flow — to poll SFTP AS the flow's trigger instead, use kind:\"sftpStart\"). " +
+        "Additional confirmed step kinds (2026-08-16, from a tenant reference flow): filter, xmlModifier, " +
+        "writeVariables, splitter + gather (split/aggregate pair), and the four Data Store operations " +
+        "(dataStoreGet/Put/Select/Delete). " +
+        "REUSABLE SUB-FLOWS: declare 'localProcesses' (each becomes its own sibling Local Integration Process, " +
+        "laid out independently and stacked below the main pool) and call one via a 'processCall' step referencing " +
+        "its 'id'. " +
+        "EXCEPTION SUBPROCESS — ON BY DEFAULT: both the main flow and every 'localProcesses' entry auto-generate a " +
+        "global-error-handling Exception Subprocess (Error Start Event -> ... -> Message End Event, endKind:" +
+        "\"message\" always the default for BOTH — a deliberate always-on convention, not conditional on process " +
+        "type) unless its 'exceptionSubprocess' field is explicitly set to false. endKind:\"error\" (Error End " +
+        "Event) is still supported and confirmed real, but opt-in only. Step kinds needing their own " +
+        "adapter (timer/httpsStart/sftpStart/requestReply/send/pollEnrich) are refused inside an Exception " +
+        "Subprocess: use contentModifier/groovyScript/filter/writeVariables/dataStore*/processCall/router for " +
+        "error-handling logic instead. An Exception Subprocess's own internal steps get the same real ELK layout " +
+        "pass and individual diagram shapes as everything else (an earlier version of this tool skipped that as a " +
+        "simplification — confirmed live 2026-08-16 that doing so breaks the web editor's own loader entirely, " +
+        "\"Error while loading the details of the integration flow\", even when ValidateIntegrationDesigntimeArtifact " +
+        "itself passes clean — that OData validation endpoint doesn't check for missing diagram shapes at all). " +
         "RUNTIME PROFILE POLICY — 'iflmap' only, never 'integrationcell': whichever shell ends up holding the " +
         "content (freshly created via reuseExistingShell:false, or an existing one via reuseExistingShell:true), " +
         "this tool downloads it, checks its REAL SAP-RuntimeProfile, and refuses to push content if it isn't " +
@@ -479,6 +673,26 @@ export function registerIflowBuilderTools(server) {
         description: z.string().optional(),
         parameters: z.array(ParameterSchema).default([]).describe("Externalized parameters. Any {{Name}} used in steps but not listed here is auto-added."),
         steps: z.array(StepSchema).min(1).describe(`Ordered flow steps; steps[0] must be kind: ${START_KINDS.join(" or ")}.`),
+        exceptionSubprocess: exceptionSubprocessSchema(),
+        localProcesses: z
+          .array(
+            z.object({
+              id: z.string().describe("Technical key referenced by 'processCall' steps' processId — anywhere in this build, including from another localProcesses entry — NOT the final generated element id."),
+              name: z.string(),
+              steps: z
+                .array(StepSchema)
+                .min(1)
+                .describe("Ordinary steps — no start-kind step (timer/httpsStart/sftpStart): a Local Integration Process is entered via a 'processCall' step, not an external trigger."),
+              exceptionSubprocess: exceptionSubprocessSchema(),
+            })
+          )
+          .default([])
+          .describe(
+            "Reusable sub-flows (Local Integration Process), each invoked via a 'processCall' step referencing " +
+              "its 'id'. Confirmed real structure from AI_Agent_Reference_IFlow (2026-08-16) — each becomes its " +
+              "own sibling <bpmn2:process>, laid out (via the same real ELK engine) stacked below the main pool. " +
+              "Each gets its own default-ON Exception Subprocess, same as the main flow."
+          ),
         reuseExistingShell: z
           .boolean()
           .default(false)
@@ -512,7 +726,11 @@ export function registerIflowBuilderTools(server) {
         offline: z
           .boolean()
           .default(false)
-          .describe("Skip the tenant entirely — generate the zip locally from a best-effort built-in template. Lower fidelity; verify in the web editor before trusting it. Useful when ALLOW_WRITE is off or for a quick local preview."),
+          .describe(
+            "Skip the tenant entirely — generate the zip from a best-effort built-in template and return it " +
+              "inline as zipBase64 (this server never writes it to disk). Lower fidelity; verify in the web " +
+              "editor before trusting it. Useful when ALLOW_WRITE is off or for a quick preview."
+          ),
         confirm: z.boolean().optional().describe("Must be true to proceed (skipped automatically when offline:true, since nothing is written to the tenant)."),
       },
     },
@@ -523,26 +741,51 @@ export function registerIflowBuilderTools(server) {
         if (id !== args.id) warnings.push(`Artifact Id "${args.id}" contained characters CPI rejects — using "${id}" instead. The display Name keeps your original text.`);
         const name = args.name || args.id;
 
-        // Build + render the graph before touching the tenant at all — fail fast and
-        // cheaply on an unsupported/inconsistent spec.
-        const graph = buildFlowGraph(args);
-        const rendered = await renderFlowGraph(graph);
+        // Build + render everything (main flow, its Exception Subprocess, and every
+        // Local Integration Process + its own Exception Subprocess) before touching
+        // the tenant at all — fail fast and cheaply on an unsupported/inconsistent spec.
+        const rendered = await assembleIflow(args);
         warnings.push(...rendered.warnings);
-        const usedPlaceholders = findPlaceholders(rendered.processInner + rendered.collaborationExtra + Object.values(rendered.scripts).join("\n"));
+
+        // Local, dependency-free well-formedness + duplicate-id check — added
+        // 2026-08-16 after hitting both failure classes live: a base64-relay
+        // transcription bug that merged two properties into one malformed tag, and a
+        // Local Integration Process silently colliding id-wise with the main process
+        // (surfaced by CPI as the opaque "Parent process cannot be assigned to the
+        // Process Call"). Runs before ANY push (online or offline) — no network call,
+        // no tenant round-trip needed to catch a bug this cheap to catch locally.
+        const localValidation = validateAssembledIflow(rendered);
+        if (!localValidation.valid) {
+          throw new Error(
+            `Generated XML failed local well-formedness/duplicate-id validation before any push was attempted — ` +
+              `this is a bug in the generator itself, not your spec:\n${localValidation.errors.join("\n")}`
+          );
+        }
+
+        const usedPlaceholders = findPlaceholders(
+          rendered.processInner + rendered.collaborationExtra + rendered.extraProcessesXml.join("") + Object.values(rendered.scripts).join("\n")
+        );
         const { prop, propdef, warnings: paramWarnings, params } = buildParametersFiles(args.parameters, usedPlaceholders);
         warnings.push(...paramWarnings);
 
         if (args.offline) {
           const iflw = injectFlowContent(buildOfflineShellIflw("Process_1", name.replace(/\s+/g, "_"), "Collaboration_1"), rendered);
           const zipBuf = await assembleOfflineZip({ id, name, iflw, prop, propdef, scripts: rendered.scripts });
-          const zipFilePath = await saveZip(zipBuf, `${id}-offline`);
           return {
             mode: "offline",
             artifactId: id,
-            zipFilePath,
+            encoding: "base64",
+            zipBase64: zipBuf.toString("base64"),
             zipSizeBytes: zipBuf.length,
             parameters: params.map((p) => p.name),
-            warnings: [...warnings, "Offline mode: nothing was pushed to any tenant. This zip's manifest/collaboration boilerplate is a best-effort template, not a confirmed one — import it into the Integration Suite web editor to verify before relying on it."],
+            warnings: [
+              ...warnings,
+              "Offline mode: nothing was pushed to any tenant, and nothing was written to this server's local " +
+                "disk — zipBase64 is the only copy, returned inline. This zip's manifest/collaboration " +
+                "boilerplate is a best-effort template, not a confirmed one — import it into the Integration " +
+                "Suite web editor to verify before relying on it. Decode zipBase64 to a file yourself if you " +
+                "want to inspect or push it (e.g. via push_integration_flow_content's zipBase64 argument).",
+            ],
           };
         }
 
