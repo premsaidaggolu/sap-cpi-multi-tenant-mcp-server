@@ -630,11 +630,12 @@ export function registerIflowBuilderTools(server) {
     server,
     "build_integration_flow",
     {
-      title: "Build & Deploy Integration Flow From Spec",
+      title: "Build & Validate Integration Flow From Spec",
       description:
-        "Author and deploy a REAL SAP CPI integration flow (not just an empty shell) from a structured step " +
-        "spec: creates/reuses the flow, generates confirmed-schema BPMN2/ifl XML for each step, pushes it, and " +
-        "triggers a deploy. Supported step kinds ONLY: " +
+        "Author a REAL SAP CPI integration flow (not just an empty shell) from a structured step spec: creates/" +
+        "reuses the flow, generates confirmed-schema BPMN2/ifl XML for each step, pushes it, and validates it. " +
+        "Deploy is OPT-IN (deploy:true) — by default this stops after push+validate; see STANDARD PRACTICE below. " +
+        "Supported step kinds ONLY: " +
         `${SUPPORTED_KINDS.join(", ")} — the first step must be one of: ${START_KINDS.join(", ")}; ` +
         "a step type outside this list needs the manual integration-flow-creation skill workflow instead. " +
         "Known auto-fixes applied for you: Camel Simple '==' is rewritten to '=', an unquoted comparison RHS " +
@@ -686,9 +687,17 @@ export function registerIflowBuilderTools(server) {
         "supported under the shell's runtime profile — the design-time save API never catches this, only real " +
         "validation does. If validation finds errors, deploy is skipped entirely (it would just fail the same way) " +
         "and 'challenge' is set. " +
-        "IMPORTANT — beyond that validation step, this call returns FAST by default (maxWaitMs:0): it does NOT " +
-        "sit and wait for the deploy itself to finish. It pushes content, validates it, kicks off the deploy, and " +
-        "hands back deployTaskId immediately — follow up yourself with get_build_and_deploy_status(taskId) / " +
+        "STANDARD PRACTICE (as of 2026-08-17) — deploy defaults to false: this call pushes content, runs " +
+        "ValidateIntegrationDesigntimeArtifact, and STOPS there by default, whether or not validation found " +
+        "errors. It does NOT deploy unless the caller explicitly passes deploy:true. The expected workflow for " +
+        "an AI client calling this tool: push (deploy:false, the default), read 'validation' on the result, " +
+        "share that analysis with the user in plain language (clean pass, or which errors were found and what " +
+        "they likely mean), and ask the user how they want to proceed — fix the spec and rebuild, deploy as-is, " +
+        "or stop here — rather than assuming deploy should happen next. Only pass deploy:true once the user has " +
+        "explicitly asked for a deploy. " +
+        "IMPORTANT — when deploy:true IS requested, this call still returns FAST by default (maxWaitMs:0): it " +
+        "does NOT sit and wait for the deploy itself to finish. It kicks off the deploy and hands back " +
+        "deployTaskId immediately — follow up yourself with get_build_and_deploy_status(taskId) / " +
         "get_deployed_artifact_status(artifactId) in a few short separate calls a few seconds apart until it " +
         "settles. Do not raise maxWaitMs to 'wait it out' in one call: a long-blocking tool call can exceed the " +
         "calling MCP client's own tool-call timeout, which then looks exactly like a hung/crashed server even " +
@@ -743,7 +752,16 @@ export function registerIflowBuilderTools(server) {
               "Runtime Profile setting (Integration Suite → Configure → Runtime Profiles), not on this flag. " +
               "Irrelevant when offline:true, which never touches the tenant."
           ),
-        deploy: z.boolean().default(true).describe("Deploy after pushing content. false = push the design-time draft only."),
+        deploy: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Deploy after pushing content. DEFAULT FALSE as of 2026-08-17 (standard practice): push the " +
+              "design-time draft, validate it, and STOP there — do not deploy unless the caller explicitly passes " +
+              "deploy:true. Read 'validation' on the result, share the analysis (errors found, or a clean pass) " +
+              "with the user, and let THEM decide whether to fix something first or proceed to deploy, rather " +
+              "than assuming deploy should happen. Set true only once the user has explicitly asked to deploy."
+          ),
         maxWaitMs: z
           .number()
           .int()
@@ -939,7 +957,15 @@ export function registerIflowBuilderTools(server) {
         }
 
         if (!args.deploy) {
-          result.note = "Content pushed as the design-time draft only (deploy:false). Call deploy_artifact separately when ready.";
+          result.note =
+            (validation.checked
+              ? "Content pushed and validated cleanly (validation.errors is empty)."
+              : "Content pushed (validation could not be run — see warnings).") +
+            " Deploy was NOT attempted — deploy defaults to false as of 2026-08-17 (standard practice): this " +
+            "tool pushes + validates and stops there unless the caller explicitly asks for deploy:true. Share " +
+            "this result (especially 'validation') with the user and ask how they'd like to proceed — deploy now " +
+            "(call this tool again with deploy:true, or use deploy_artifact directly on this artifactId), or " +
+            "review/fix something first — rather than assuming deploy should happen.";
           return result;
         }
 

@@ -1,6 +1,6 @@
 # SAP CPI MCP Server
 
-**Version 1.3.0**
+**Version 1.4.0**
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an MCP client
 (Claude Desktop, Claude Code, etc.) **monitor and manage SAP Cloud Integration (CPI / Integration
@@ -53,15 +53,24 @@ One server instance can talk to a **single CPI tenant or many** — see
 ### Flow authoring — build real content from a spec
 | Tool | Purpose |
 |------|---------|
-| `build_integration_flow` ⚠️ | Author **real iFlow content** (not just an empty shell) from a structured step spec, and deploy it end to end |
+| `build_integration_flow` ⚠️ | Author **real iFlow content** (not just an empty shell) from a structured step spec, push it, and validate it — deploy is opt-in |
 
 `create_integration_flow` above only makes an empty shell — there's no SAP API to add a
 step at a time. `build_integration_flow` is the encoded version of that whole manual
 process: give it an ordered `steps` array and it generates the confirmed-schema
-BPMN2/`ifl:` XML, splices it into a real tenant-generated shell, pushes it, deploys it,
-and polls until it finishes (or a bounded timeout, so a complex flow still resolves in
-minutes, not indefinitely). All of the hard-won gotchas below are applied automatically
-— you don't need a separate skill/instructions file loaded to get them right.
+BPMN2/`ifl:` XML, splices it into a real tenant-generated shell, pushes it, and runs
+CPI's own `ValidateIntegrationDesigntimeArtifact` check. All of the hard-won gotchas
+below are applied automatically — you don't need a separate skill/instructions file
+loaded to get them right.
+
+**Standard practice (as of 2026-08-17): `deploy` defaults to `false`.** This tool
+pushes + validates and stops there by default, whether or not validation found errors
+— it does NOT deploy unless you explicitly ask for it. The expected flow: build
+(`deploy` omitted or `false`), read the `validation` field on the result, share that
+analysis (clean pass, or which errors were found and what they likely mean), and let
+the outcome of that conversation decide the next step — fix the spec and rebuild, or
+deploy (`deploy: true`, or `deploy_artifact` on the pushed artifact directly). Set
+`deploy: true` only once that's actually been asked for.
 
 Supported step kinds (first step must be `timer`, `httpsStart`, or `sftpStart`):
 `contentModifier`, `router`, `groovyScript`, `requestReply` / `send`, `pollEnrich`,
@@ -441,6 +450,16 @@ Requires **Node.js 18+** (uses the built-in `fetch`).
 ---
 
 ## Changelog
+
+### 1.4.0
+- **Standard practice**: `build_integration_flow`'s `deploy` argument now defaults to
+  `false` (was `true`). This tool pushes content and validates it, then stops — it no
+  longer deploys automatically. The expected workflow: build, read the `validation`
+  field, share that analysis with the user, and let them decide whether to deploy
+  (`deploy: true`) or fix something first, rather than assuming deploy should happen.
+- Updated the tool's title/description and the `note` field on every non-deploying
+  result to spell out this workflow explicitly, so any MCP client calling the tool
+  follows it by default rather than relying on being told each time.
 
 ### 1.3.0
 - HTTP adapter: `authenticationMethod:"OAuth2ClientCredentials"` confirmed working
