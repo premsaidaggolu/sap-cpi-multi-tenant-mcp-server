@@ -1,6 +1,6 @@
 # SAP CPI MCP Server
 
-**Version 1.2.0**
+**Version 1.3.0**
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that lets an MCP client
 (Claude Desktop, Claude Code, etc.) **monitor and manage SAP Cloud Integration (CPI / Integration
@@ -63,10 +63,19 @@ and polls until it finishes (or a bounded timeout, so a complex flow still resol
 minutes, not indefinitely). All of the hard-won gotchas below are applied automatically
 — you don't need a separate skill/instructions file loaded to get them right.
 
-Supported step kinds (first step must be `timer` — no other trigger is encoded yet):
-`timer`, `contentModifier`, `router`, `groovyScript`, `requestReply` / `send` (with an
-`http` or `mail` adapter), `endEvent`. A step type outside this list is rejected with a
-clear error rather than a guessed XML shape.
+Supported step kinds (first step must be `timer`, `httpsStart`, or `sftpStart`):
+`contentModifier`, `router`, `groovyScript`, `requestReply` / `send`, `pollEnrich`,
+`filter`, `xmlModifier`, `writeVariables`, `splitter`, `gather`, `dataStoreGet` /
+`dataStorePut` / `dataStoreSelect` / `dataStoreDelete`, `processCall` (+ top-level
+`localProcesses` for Local Integration Processes), `endEvent`. A step type outside this
+list is rejected with a clear error rather than a guessed XML shape.
+
+`requestReply` / `send` adapters: `http` (auth `None` and `OAuth2ClientCredentials`
+confirmed working, plus retry parameters — `retryOnException`, `retryIteration`,
+`retryInterval`, `retryOnConnectionFailure`, `httpErrorResponseCodes`,
+`throwExceptionOnFailure`), `mail`, `odata` (OData V2 / HCIOData), `odatav4` (OData V4 /
+HCIOData — a distinct property set from plain `odata`), `sftpWrite`, `jms`, `soap`
+(send-only), `processDirect` (requestReply-only). `pollEnrich` adapter: `sftpPoll`.
 
 Auto-fixes applied for you:
 - Camel Simple `==` is rewritten to `=` (CPI's condition parser only accepts `=`).
@@ -432,6 +441,28 @@ Requires **Node.js 18+** (uses the built-in `fetch`).
 ---
 
 ## Changelog
+
+### 1.3.0
+- HTTP adapter: `authenticationMethod:"OAuth2ClientCredentials"` confirmed working
+  (2026-08-17, against a real hand-built reference channel,
+  `reference_iflow_for_HTTP_Oauth_and_OData_V4_adapter`) — previously thought broken
+  from a 2026-08-14 test that used the raw, unspaced enum value; CPI actually wants the
+  spaced display value ("OAuth2 Client Credentials"), which the adapter already mapped
+  to via `authMethodValue` but hadn't been re-tested since.
+- HTTP adapter: new retry parameters — `retryOnException`, `retryIteration`,
+  `retryInterval`, `retryOnConnectionFailure`, `httpErrorResponseCodes`,
+  `throwExceptionOnFailure` — confirmed real property shape from the same reference
+  channel.
+- New `odatav4` adapter (OData V4 / HCIOData) — a distinct property set from the
+  existing `odata` (V2) adapter (`csrfEnabled` not `isCSRFEnabled`,
+  `connectionReuse`/`allowChunking`, `resourcePathForOdatav4`). Confirmed real from the
+  same reference channel using `operation:"get"` + `OAuth2ClientCredentials`.
+- **Root-cause fix**: the existing `odata` (V2) adapter's `authenticationMethod` was
+  being sent through the HTTP-only spaced-display-value mapping, which is exactly
+  backwards for OData — OData wants the RAW unspaced enum value. This is very likely
+  why `OAuth2ClientCredentials` was previously "confirmed BROKEN" for `odata`; it's now
+  sent raw, matching the confirmed-real `odatav4` reference. Not yet independently
+  re-confirmed against a live V2-specific deploy.
 
 ### 1.2.0
 - `build_integration_flow` no longer writes anything to this server's local disk in

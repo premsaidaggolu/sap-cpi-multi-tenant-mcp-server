@@ -667,7 +667,12 @@ function createEndEventNode(step, g) {
 
 // --- Request-Reply / Send adapters (step -> receiver participant) ------------
 
-const HTTP_AUTH_CONFIRMED = new Set(["None"]);
+// "OAuth2ClientCredentials" confirmed working 2026-08-17 against a real hand-built
+// reference channel (reference_iflow_for_HTTP_Oauth_and_OData_V4_adapter) — the value
+// this adapter actually needs is the SPACED display form ("OAuth2 Client Credentials",
+// via authMethodValue below), not the raw enum identifier a 2026-08-14 test used
+// unmapped. Basic/ClientCertificate remain unconfirmed.
+const HTTP_AUTH_CONFIRMED = new Set(["None", "OAuth2ClientCredentials"]);
 
 // Deliberately NOT using `new URL(...)` here: WHATWG URL parsing lowercases the host
 // component and can reject or mis-handle a host that's entirely a {{Placeholder}}
@@ -699,8 +704,8 @@ function httpMessageFlowXml(mfId, sourceRef, targetRef, adapter, system, g) {
   if (!HTTP_AUTH_CONFIRMED.has(adapter.authenticationMethod)) {
     g.warnings.push(
       `HTTP adapter targeting "${system}": authenticationMethod "${adapter.authenticationMethod}" is not confirmed ` +
-        `working (only "None" is) — this adapter rejected "OAuth2ClientCredentials" outright in a live test. Use ` +
-        `adapter type "odata" for real auth against an OData service.`
+        `working (only "None" and "OAuth2ClientCredentials" are) — verify in the web editor's Problems tab. Use ` +
+        `adapter type "odata"/"odatav4" for confirmed OAuth2 auth against an OData service instead.`
     );
   }
   const props =
@@ -719,6 +724,15 @@ function httpMessageFlowXml(mfId, sourceRef, targetRef, adapter, system, g) {
     ifl("httpRequestTimeout", String(adapter.timeoutMs ?? 60000)) +
     ifl("httpShouldSendBody", "false") +
     ifl("enableMPLAttachments", "true") +
+    // Retry parameters — confirmed real property shape 2026-08-17 from
+    // reference_iflow_for_HTTP_Oauth_and_OData_V4_adapter.
+    ifl("retryOnException", (adapter.retryOnException ?? true) ? "true" : "false") +
+    ifl("retryOnConnectionFailure", (adapter.retryOnConnectionFailure ?? true) ? "true" : "false") +
+    ifl("retryIteration", String(adapter.retryIteration ?? 3)) +
+    ifl("retryInterval", String(adapter.retryInterval ?? 5)) +
+    ifl("httpErrorResponseCodes", adapter.httpErrorResponseCodes ?? "500,502,501") +
+    ifl("throwExceptionOnFailure", (adapter.throwExceptionOnFailure ?? true) ? "true" : "false") +
+    ifl("retryOnExceptionsTable", "") +
     ifl("Name", "HTTP") +
     ifl("componentVersion", "1.20") +
     ifl("TransportProtocolVersion", "1.20.1") +
@@ -774,6 +788,12 @@ function mailMessageFlowXml(mfId, sourceRef, targetRef, adapter, system) {
   return `<bpmn2:messageFlow id="${mfId}" name="Mail" sourceRef="${sourceRef}" targetRef="${targetRef}"><bpmn2:extensionElements>${props}</bpmn2:extensionElements></bpmn2:messageFlow>`;
 }
 
+// authenticationMethod is sent RAW here (no authMethodValue display-name mapping) —
+// root-caused 2026-08-17: unlike the HTTP adapter, which wants the spaced display
+// value ("OAuth2 Client Credentials"), OData wants the raw unspaced enum identifier
+// ("OAuth2ClientCredentials") verbatim. Sending the spaced form here (as this builder
+// used to) is exactly what made OAuth2ClientCredentials "confirmed BROKEN" in an
+// earlier 2026-08-16 test — CPI rejected the spaced value it was actually being sent.
 function odataMessageFlowXml(mfId, sourceRef, targetRef, adapter, system, g) {
   if (adapter.authenticationMethod !== "None" && !adapter.credentialName) {
     g.warnings.push(`OData adapter targeting "${system}": authenticationMethod is "${adapter.authenticationMethod}" but no credentialName was given.`);
@@ -787,7 +807,7 @@ function odataMessageFlowXml(mfId, sourceRef, targetRef, adapter, system, g) {
     ifl("fields", "") +
     ifl("pagination", adapter.pagination ? "1" : "0") +
     ifl("odatapagesize", "1000") +
-    ifl("authenticationMethod", authMethodValue(adapter.authenticationMethod || "None")) +
+    ifl("authenticationMethod", adapter.authenticationMethod || "None") +
     ifl("alias", adapter.credentialName || "") +
     ifl("isCSRFEnabled", adapter.isCSRFEnabled ? "true" : "false") +
     ifl("contentType", adapter.contentType || "application/atom+xml") +
@@ -817,6 +837,63 @@ function odataMessageFlowXml(mfId, sourceRef, targetRef, adapter, system, g) {
     ifl("ComponentSWCVId", "1.24.0") +
     ifl("componentVersion", "1.24") +
     ifl("cmdVariantUri", "ctype::AdapterVariant/cname::sap:HCIOData/tp::HTTP/mp::OData V2/direction::Receiver/version::1.24.0");
+  return `<bpmn2:messageFlow id="${mfId}" name="OData" sourceRef="${sourceRef}" targetRef="${targetRef}"><bpmn2:extensionElements>${props}</bpmn2:extensionElements></bpmn2:messageFlow>`;
+}
+
+// OData V4 — a distinct adapter variant from odataMessageFlowXml (V2) above: different
+// ComponentType/MessageProtocol pairing (still ComponentType HCIOData, but
+// MessageProtocol "OData V4" instead of "OData V2"), a different property set
+// (csrfEnabled/connectionReuse/allowChunking instead of isCSRFEnabled/
+// enableBatchProcessing/enableTLSSessionReuse, resourcePathForOdatav4 instead of
+// resourcePath), and — like V2 — authenticationMethod sent RAW (unspaced), same
+// root-cause reasoning as odataMessageFlowXml above. Confirmed real property shape and
+// values 2026-08-17 from reference_iflow_for_HTTP_Oauth_and_OData_V4_adapter
+// (operation:"get" + authenticationMethod:"OAuth2ClientCredentials" specifically).
+function odatav4MessageFlowXml(mfId, sourceRef, targetRef, adapter, system, g) {
+  if (adapter.authenticationMethod !== "None" && !adapter.credentialName) {
+    g.warnings.push(`OData V4 adapter targeting "${system}": authenticationMethod is "${adapter.authenticationMethod}" but no credentialName was given.`);
+  }
+  const props =
+    ifl("batchEntities", "") +
+    ifl("Description", "") +
+    ifl("pagination", adapter.pagination ? "true" : "false") +
+    ifl("odataCertAuthPrivateKeyAlias", "") +
+    ifl("ComponentNS", "sap") +
+    ifl("odatav4OperationExpression", "") +
+    ifl("metadataAllowedURIParams", "") +
+    ifl("Name", "OData") +
+    ifl("TransportProtocolVersion", "1.30.1") +
+    ifl("ComponentSWCVName", "external") +
+    ifl("proxyPort", "") +
+    ifl("enableMPLAttachments", "true") +
+    ifl("csrfEnabled", (adapter.csrfEnabled ?? true) ? "true" : "false") +
+    ifl("receiveTimeOut", String(adapter.timeoutSec ?? 60)) +
+    ifl("connectionReuse", (adapter.connectionReuse ?? true) ? "true" : "false") +
+    ifl("alias", adapter.credentialName || "") +
+    ifl("MessageProtocol", "OData V4") +
+    ifl("ComponentSWCVId", "1.30.1") +
+    ifl("direction", "Receiver") +
+    ifl("scc_location_id", "") +
+    ifl("metadataAllowedHeaders", "") +
+    ifl("ComponentType", "HCIOData") +
+    ifl("address", adapter.address) +
+    ifl("resourcePathForOdatav4", adapter.resourcePath) +
+    ifl("isXSDGenerationRequired", "") +
+    ifl("allowChunking", adapter.allowChunking ? "true" : "false") +
+    ifl("queryOptions", adapter.queryOptions || "") +
+    ifl("proxyType", "default") +
+    ifl("componentVersion", "1.23") +
+    ifl("proxyHost", "") +
+    ifl("edmxFilePath", "") +
+    ifl("system", system) +
+    ifl("authenticationMethod", adapter.authenticationMethod || "None") +
+    ifl("whitelistResponseHeaders", "traceparent") +
+    ifl("TransportProtocol", "HTTP") +
+    ifl("cmdVariantUri", "ctype::AdapterVariant/cname::sap:HCIOData/tp::HTTP/mp::OData V4/direction::Receiver/version::1.23.0") +
+    ifl("fields", "") +
+    ifl("whitelistRequestHeaders", "traceparent") +
+    ifl("operation", adapter.operation || "get") +
+    ifl("MessageProtocolVersion", "1.30.1");
   return `<bpmn2:messageFlow id="${mfId}" name="OData" sourceRef="${sourceRef}" targetRef="${targetRef}"><bpmn2:extensionElements>${props}</bpmn2:extensionElements></bpmn2:messageFlow>`;
 }
 
@@ -970,6 +1047,7 @@ const SEND_ADAPTER_BUILDERS = {
   http: httpMessageFlowXml,
   mail: mailMessageFlowXml,
   odata: odataMessageFlowXml,
+  odatav4: odatav4MessageFlowXml,
   sftpWrite: sftpWriteMessageFlowXml,
   jms: jmsMessageFlowXml,
   soap: soapMessageFlowXml,
@@ -1002,7 +1080,7 @@ function createServiceTaskNode(step, g) {
       ? "ctype::FlowstepVariant/cname::Send/version::1.0.4"
       : "ctype::FlowstepVariant/cname::ExternalCall/version::1.0.4";
 
-  const suffix = { http: "Endpoint", mail: "Mail_Server", odata: "OData_Service", sftpWrite: "Sftp_Server", jms: "Queue", soap: "Soap_Service", processDirect: "Process" }[step.adapter.type] || "Endpoint";
+  const suffix = { http: "Endpoint", mail: "Mail_Server", odata: "OData_Service", odatav4: "OData_V4_Service", sftpWrite: "Sftp_Server", jms: "Queue", soap: "Soap_Service", processDirect: "Process" }[step.adapter.type] || "Endpoint";
   // Confirmed live 2026-08-16 from a hand-built reference flow (WeatherForecastMailIFlow,
   // edited directly in the SAP web editor): a requestReply/send step's own receiver
   // participant sits ABOVE the pool (negative y relative to it), never "below" — "below"

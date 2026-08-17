@@ -141,10 +141,21 @@ const StepSchema = z.lazy(() =>
           authenticationMethod: z.enum(["None", "Basic", "ClientCertificate", "OAuth2ClientCredentials"]).default("None"),
           credentialName: z.string().optional(),
           timeoutMs: z.number().int().default(60000),
+          retryOnException: z.boolean().default(true).describe("Retry the call if it throws an exception."),
+          retryOnConnectionFailure: z.boolean().default(true).describe("Retry the call on a connection-level failure (distinct from an HTTP error-status response)."),
+          retryIteration: z.number().int().default(3).describe("Max number of retry attempts."),
+          retryInterval: z.number().int().default(5).describe("Seconds to wait between retry attempts."),
+          httpErrorResponseCodes: z.string().default("500,502,501").describe("Comma-separated HTTP status codes that trigger a retry, e.g. \"500,502,501\"."),
+          throwExceptionOnFailure: z.boolean().default(true).describe("Raise an exception if the call ultimately fails after retries are exhausted."),
         }).describe(
-          "Plain HTTP receiver. Only authenticationMethod:\"None\" is confirmed working — a live deploy on " +
-            "2026-08-14 confirmed this adapter rejects \"OAuth2ClientCredentials\" outright. For an OData service " +
-            "needing Basic/OAuth2/ClientCertificate auth, use type:\"odata\" instead."
+          "Plain HTTP receiver. authenticationMethod:\"OAuth2ClientCredentials\" is CONFIRMED working as of " +
+            "2026-08-17 (previously thought broken from a 2026-08-14 test — that test used the raw, unspaced enum " +
+            "value; CPI actually wants the spaced display value \"OAuth2 Client Credentials\", which this builder " +
+            "now sends, confirmed against a real hand-built reference channel — " +
+            "reference_iflow_for_HTTP_Oauth_and_OData_V4_adapter). Basic/ClientCertificate remain unconfirmed. " +
+            "Retry parameters (retryOnException/retryIteration/retryInterval/retryOnConnectionFailure/" +
+            "httpErrorResponseCodes/throwExceptionOnFailure) are also confirmed real from the same reference " +
+            "channel. For an OData service, use type:\"odata\" (V2) or type:\"odatav4\" instead."
         ),
         z.object({
           type: z.literal("mail"),
@@ -174,12 +185,36 @@ const StepSchema = z.lazy(() =>
           timeoutSec: z.number().int().default(60),
         }).describe(
           "OData V2 receiver (ComponentType HCIOData) — use this, not type:\"http\", for any OData call needing " +
-            "real authentication. Adapted from a community reference (github.com/achgithub/mcp-cpi-tools), not yet " +
-            "independently confirmed against a live deploy here — verify in the web editor's Problems tab first. " +
-            "authenticationMethod:\"OAuth2ClientCredentials\" is CONFIRMED BROKEN live 2026-08-16 — CPI rejects it " +
-            "with \"Invalid value 'OAuth2 Client Credentials' entered in 'Authentication' field\" regardless of " +
-            "whether the camelCase enum identifier or a space-separated label is sent; the real expected value " +
-            "isn't known yet. Use authenticationMethod:\"None\" (confirmed) until this is resolved."
+            "real authentication. Adapted from a community reference (github.com/achgithub/mcp-cpi-tools). " +
+            "authenticationMethod:\"OAuth2ClientCredentials\" was previously thought BROKEN (2026-08-16 test): CPI " +
+            "rejected the spaced display value \"OAuth2 Client Credentials\" this builder was sending. Root cause " +
+            "found 2026-08-17 from a real reference channel (reference_iflow_for_HTTP_Oauth_and_OData_V4_adapter): " +
+            "unlike the HTTP adapter, OData wants the RAW unspaced enum value (\"OAuth2ClientCredentials\") — this " +
+            "builder now sends that. Directly confirmed for the sibling type:\"odatav4\" adapter against that same " +
+            "reference channel; not yet independently re-confirmed against a live V2-specific deploy, so verify in " +
+            "the web editor's Problems tab first if it matters for your case."
+        ),
+        z.object({
+          type: z.literal("odatav4"),
+          address: z.string().describe("Base OData V4 service URL, e.g. https://api.example.com/v1 — the entity path goes in resourcePath, not here."),
+          resourcePath: z.string().describe("Entity path for the OData V4 call, e.g. \"Products\" or \"Products('123')\"."),
+          operation: z.string().default("get").describe("Only \"get\" is confirmed working (from a real reference channel) — other values follow the same shape but are unconfirmed guesses."),
+          queryOptions: z.string().optional().describe("Static OData V4 query options, e.g. \"$select=A,B\"."),
+          pagination: z.boolean().default(false),
+          csrfEnabled: z.boolean().default(true).describe("Note the property key is \"csrfEnabled\" here, not \"isCSRFEnabled\" like the V2 odata adapter."),
+          connectionReuse: z.boolean().default(true),
+          allowChunking: z.boolean().default(false),
+          authenticationMethod: z.enum(["None", "Basic", "ClientCertificate", "OAuth2ClientCredentials"]).default("None"),
+          credentialName: z.string().optional().describe("Security Material credential alias — required unless authenticationMethod is None. Maps to the channel's \"alias\" property, same as the V2 odata adapter."),
+          timeoutSec: z.number().int().default(60),
+        }).describe(
+          "OData V4 receiver (ComponentType HCIOData, MessageProtocol \"OData V4\") — a distinct adapter from " +
+            "type:\"odata\" (V2), with its own property set (e.g. \"csrfEnabled\" not \"isCSRFEnabled\", " +
+            "\"connectionReuse\"/\"allowChunking\" instead of batch-processing flags). Confirmed real 2026-08-17 " +
+            "from a hand-built reference channel (reference_iflow_for_HTTP_Oauth_and_OData_V4_adapter) using " +
+            "operation:\"get\" with authenticationMethod:\"OAuth2ClientCredentials\" — that specific combination is " +
+            "directly confirmed; other operations/auth combinations follow the same shape but aren't yet " +
+            "individually verified."
         ),
         z.object({
           type: z.literal("sftpWrite"),
@@ -606,9 +641,12 @@ export function registerIflowBuilderTools(server) {
         "gets quoted, participant/element names have whitespace replaced with '_', and every adapter's 'system' " +
         "property is always set to match its own participant name (a mismatch there — confirmed live 2026-08-14 — " +
         "produces an opaque 'Enter adapter details for channel' error with no other symptom, so this isn't caller-" +
-        "configurable). requestReply/send adapters: http (auth 'None' only — use 'odata' for real auth), mail, " +
-        "odata (OData V2 / HCIOData — authenticationMethod:\"OAuth2ClientCredentials\" confirmed BROKEN live " +
-        "2026-08-16, CPI rejects it regardless of casing/spacing; use \"None\" or \"Basic\" until resolved), sftpWrite (write/" +
+        "configurable). requestReply/send adapters: http (auth 'None' and 'OAuth2ClientCredentials' confirmed " +
+        "working as of 2026-08-17, plus confirmed retry parameters — see the adapter's own description for " +
+        "detail), mail, odata (OData V2 / HCIOData — authenticationMethod:\"OAuth2ClientCredentials\" now sends " +
+        "the correct raw-unspaced value, root-caused 2026-08-17; previously thought broken from a wrong-value bug, " +
+        "see the adapter's own description), odatav4 (OData V4 / HCIOData, distinct property set from plain " +
+        "odata — confirmed real 2026-08-17 with operation:\"get\" + OAuth2ClientCredentials), sftpWrite (write/" +
         "move a file), jms (confirmed live 2026-08-15 — needs expirationPeriodSec, defaults to 30), soap (send " +
         "ONLY, confirmed live 2026-08-16 — needs soapWsdlURL if soapServiceName/soapWsdlPortName/operationName " +
         "are set, also confirmed live), processDirect (internal iFlow-to-iFlow call, requestReply ONLY — confirmed " +

@@ -28,22 +28,20 @@ export function attrEscape(value) {
 }
 
 /**
- * Map this codebase's camelCase authenticationMethod enum values (used across the
- * zod schema for http/odata adapters) toward CPI's actual `authenticationMethod`
- * ifl:property value. STATUS 2026-08-16: NOT a confirmed fix, still an open problem.
- * The raw enum identifier "OAuth2ClientCredentials" fails ValidateIntegrationDesign
- * timeArtifact with "Invalid value 'OAuth2 Client Credentials' entered in
- * 'Authentication' field" — this was first misread as the error message revealing
- * the correct value, so this mapping was added to space it out; re-tested live and
- * the SAME error persists verbatim with the spaced value too. So neither
- * "OAuth2ClientCredentials" nor "OAuth2 Client Credentials" is the value CPI's
- * odata/HCIOData adapter actually wants for OAuth2 Client Credentials auth — the
- * error text apparently just echoes back whatever was submitted rather than naming
- * the expected one. Left in place since it's harmless (both single-word values pass
- * through unchanged, and "ClientCertificate" is still untested either way), but do
- * NOT treat OAuth2ClientCredentials as working for odata — use authenticationMethod:
- * "None" (or "Basic", untested) until the real expected value is confirmed some
- * other way (e.g. inspecting a hand-built OAuth2-configured channel in the web editor).
+ * Map this codebase's camelCase authenticationMethod enum values toward the SPACED
+ * display value CPI's HTTP adapter actually wants for its `authenticationMethod`
+ * ifl:property. HTTP-ADAPTER-ONLY — see steps.js's odataMessageFlowXml/
+ * odatav4MessageFlowXml for why: root-caused 2026-08-17 from a real hand-built
+ * reference channel (reference_iflow_for_HTTP_Oauth_and_OData_V4_adapter). That
+ * channel's HTTP messageFlow uses authenticationMethod:"OAuth2 Client Credentials"
+ * (spaced) — confirming this mapping is exactly right for HTTP. Its OData V4
+ * messageFlow, in the SAME reference flow, instead uses the raw unspaced
+ * "OAuth2ClientCredentials" — confirming odata/odatav4 must NOT go through this
+ * mapping at all (they send adapter.authenticationMethod raw). An earlier 2026-08-16
+ * odata test that got "Invalid value 'OAuth2 Client Credentials' entered in
+ * 'Authentication' field" was failing for exactly this reason: it was (wrongly)
+ * routing odata's value through this HTTP-only mapping too, sending the spaced form
+ * odata doesn't want.
  */
 const AUTH_METHOD_DISPLAY_VALUES = {
   ClientCertificate: "Client Certificate",
