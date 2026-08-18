@@ -2,6 +2,7 @@
 // Handles OAuth2 client-credentials token retrieval (with caching) and
 // authenticated requests against the CPI OData v1 API (/api/v1).
 import { currentTenant } from "./tenantScope.js";
+import { getSecret as getCredStoreSecret } from "./credStore.js";
 
 // Every outbound fetch() in this file passes this as its `signal`. Node's fetch has no
 // default timeout — a stalled network hop (VPN drop, tenant unreachable, proxy hang)
@@ -57,8 +58,17 @@ function buildTenantRegistry() {
     const tokenUrl = process.env[`CPI_TOKEN_URL${n}`];
     const clientId = process.env[`CPI_CLIENT_ID${n}`];
     const clientSecret = process.env[`CPI_CLIENT_SECRET${n}`];
-    const need = { CPI_BASE_URL: baseUrl, CPI_TOKEN_URL: tokenUrl, CPI_CLIENT_ID: clientId, CPI_CLIENT_SECRET: clientSecret };
+    // CPI_CREDSTORE_KEY<N> is an alternative to CPI_CLIENT_SECRET<N>, not an addition —
+    // when set, the secret is resolved from Credential Store (see credStore.js) at
+    // token-request time instead of read from this plaintext env var. Per-tenant, so a
+    // deployment can migrate one tenant at a time rather than all-or-nothing.
+    const credStoreKey = process.env[`CPI_CREDSTORE_KEY${n}`];
+    const credStoreNamespace = process.env[`CPI_CREDSTORE_NAMESPACE${n}`];
+    const need = { CPI_BASE_URL: baseUrl, CPI_TOKEN_URL: tokenUrl, CPI_CLIENT_ID: clientId };
     const gaps = Object.entries(need).filter(([, v]) => !v).map(([k]) => `${k}${n}`);
+    if (!clientSecret && !credStoreKey) {
+      gaps.push(`CPI_CLIENT_SECRET${n} (or CPI_CREDSTORE_KEY${n})`);
+    }
     if (gaps.length) {
       incomplete.push(`tenant #${n} (${name}) is missing ${gaps.join(", ")}`);
       continue;
@@ -71,6 +81,8 @@ function buildTenantRegistry() {
       tokenUrl,
       clientId,
       clientSecret,
+      credStoreKey,
+      credStoreNamespace,
       // Per-tenant override of the global ALLOW_WRITE flag — leave unset to inherit it
       // (e.g. a Dev tenant can allow writes while Prod stays read-only under one flag).
       allowWrite: allowWriteRaw !== undefined ? String(allowWriteRaw).toLowerCase() === "true" : undefined,
@@ -96,6 +108,8 @@ function buildTenantRegistry() {
       tokenUrl: process.env.CPI_TOKEN_URL,
       clientId: process.env.CPI_CLIENT_ID,
       clientSecret: process.env.CPI_CLIENT_SECRET,
+      credStoreKey: process.env.CPI_CREDSTORE_KEY,
+      credStoreNamespace: process.env.CPI_CREDSTORE_NAMESPACE,
       allowWrite: undefined,
     };
   }
@@ -162,6 +176,8 @@ function config() {
       CPI_TOKEN_URL: t.tokenUrl,
       CPI_CLIENT_ID: t.clientId,
       CPI_CLIENT_SECRET: t.clientSecret,
+      CPI_CREDSTORE_KEY: t.credStoreKey,
+      CPI_CREDSTORE_NAMESPACE: t.credStoreNamespace,
     };
   }
   return {
@@ -169,14 +185,20 @@ function config() {
     CPI_TOKEN_URL: process.env.CPI_TOKEN_URL,
     CPI_CLIENT_ID: process.env.CPI_CLIENT_ID,
     CPI_CLIENT_SECRET: process.env.CPI_CLIENT_SECRET,
+    CPI_CREDSTORE_KEY: process.env.CPI_CREDSTORE_KEY,
+    CPI_CREDSTORE_NAMESPACE: process.env.CPI_CREDSTORE_NAMESPACE,
   };
 }
 
 function assertConfig() {
   const cfg = config();
-  const missing = Object.entries(cfg)
-    .filter(([, v]) => !v)
-    .map(([k]) => k);
+  // CPI_CLIENT_SECRET and CPI_CREDSTORE_KEY are alternatives — either one satisfies the
+  // "how do we authenticate to CPI" requirement, so they're checked as a pair, not
+  // individually, unlike the other three which are always required outright.
+  const missing = ["CPI_BASE_URL", "CPI_TOKEN_URL", "CPI_CLIENT_ID"].filter((k) => !cfg[k]);
+  if (!cfg.CPI_CLIENT_SECRET && !cfg.CPI_CREDSTORE_KEY) {
+    missing.push("CPI_CLIENT_SECRET (or CPI_CREDSTORE_KEY)");
+  }
   if (missing.length) {
     throw new Error(
       `Missing required environment variables: ${missing.join(", ")}. ` +
@@ -184,6 +206,21 @@ function assertConfig() {
         `multiple tenants, or the plain CPI_BASE_URL for a single one).`
     );
   }
+}
+
+/**
+ * Resolve the active tenant's CPI OAuth client secret — either the plaintext
+ * CPI_CLIENT_SECRET env var, or (if configured) a Credential Store lookup keyed by
+ * CPI_CREDSTORE_KEY. Only called from getAccessToken, right before it's needed, so a
+ * Credential Store round trip happens at most once per tenant per CACHE_TTL_MS
+ * (see credStore.js), not on every cpiGet/cpiRequest call.
+ */
+async function resolveClientSecret() {
+  const cfg = config();
+  if (cfg.CPI_CLIENT_SECRET) return cfg.CPI_CLIENT_SECRET;
+  if (cfg.CPI_CREDSTORE_KEY) return getCredStoreSecret(cfg.CPI_CREDSTORE_KEY, cfg.CPI_CREDSTORE_NAMESPACE);
+  // assertConfig() (called before this in getAccessToken) should make this unreachable.
+  throw new Error("No CPI client secret available (checked CPI_CLIENT_SECRET and CPI_CREDSTORE_KEY).");
 }
 
 // --- Host masking ------------------------------------------------------------
@@ -242,7 +279,7 @@ const tokenCacheByTenant = new Map(); // name -> { token, expiry }
 
 async function getAccessToken() {
   assertConfig();
-  const { CPI_TOKEN_URL, CPI_CLIENT_ID, CPI_CLIENT_SECRET } = config();
+  const { CPI_TOKEN_URL, CPI_CLIENT_ID } = config();
   const key = tenantCacheKey();
   const now = Date.now();
   // Reuse token until 60s before expiry.
@@ -251,7 +288,8 @@ async function getAccessToken() {
     return cached.token;
   }
 
-  const basic = Buffer.from(`${CPI_CLIENT_ID}:${CPI_CLIENT_SECRET}`).toString("base64");
+  const clientSecret = await resolveClientSecret();
+  const basic = Buffer.from(`${CPI_CLIENT_ID}:${clientSecret}`).toString("base64");
   const res = await fetch(CPI_TOKEN_URL, {
     method: "POST",
     headers: {
