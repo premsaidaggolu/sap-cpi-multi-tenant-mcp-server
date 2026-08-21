@@ -35,5 +35,5 @@ applications:
     #   cf cups cpi-credentials -p '{"clientId":"...","clientSecret":"..."}'
     # services:
     #   - cpi-credentials
-    services:
-      - cpi-credstore
+    #services:
+      #- cpi-credstore
