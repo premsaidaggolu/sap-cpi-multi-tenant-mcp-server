@@ -10,6 +10,14 @@
 // Adapted from a community reference (github.com/achgithub/mcp-cpi-tools), not yet
 // independently confirmed here: odata, sftpWrite, jms.
 //
+// 2026-08-17: soapStart, xsltMapping, messageMapping (pass-through), and the
+// successfactors/servicenow/idoc adapter types were added from cataloging SEVEN real
+// .iflw files downloaded from SAP's Discover content packages (not a live tenant
+// deploy) — property shapes are transcribed verbatim from those real exports, but
+// NONE of the five are independently confirmed against ValidateIntegrationDesigntimeArtifact
+// here yet. Treat them the same as the "adapted from a community reference" set
+// above: verify in the web editor's Problems tab before relying on them.
+//
 // Diagram layout (2026-08-15): positions/routing are computed by the real ELK layout
 // engine (see ./layout.js) — the same one SAP's own web editor uses for its "Align"
 // button — not a hand-rolled heuristic. Graph construction below only builds
@@ -20,11 +28,12 @@ import { xmlEscape, attrEscape, rowKeyed, rowPlain, ifl, IdGen, sanitizeElementN
 import { layoutWithElk } from "./layout.js";
 
 export const SUPPORTED_KINDS = [
-  "timer", "httpsStart", "sftpStart", "contentModifier", "router", "groovyScript", "requestReply", "send",
+  "timer", "httpsStart", "sftpStart", "soapStart", "contentModifier", "router", "groovyScript", "requestReply", "send",
   "pollEnrich", "filter", "xmlModifier", "writeVariables", "splitter", "gather",
   "dataStoreGet", "dataStorePut", "dataStoreSelect", "dataStoreDelete", "processCall", "endEvent",
+  "xsltMapping", "messageMapping",
 ];
-export const START_KINDS = ["timer", "httpsStart", "sftpStart"];
+export const START_KINDS = ["timer", "httpsStart", "sftpStart", "soapStart"];
 // "processCall" (above) targets a Local Integration Process declared separately in the
 // top-level spec's "localProcesses" array — see buildLocalProcessGraph/assembleIflow
 // below — and "exceptionSubprocess" (global error handling, on by default for both the
@@ -57,6 +66,7 @@ class FlowGraph {
     this.participants = new Map(); // id -> { name, style: "sender"|"receiver", x, y, w, h, anchorNodeId, side: "left"|"below"|"above" }
     this.messageFlows = []; // { id, sourceRef, targetRef, xml }
     this.scripts = {}; // filename -> groovy source
+    this.mappingFiles = {}; // filename -> xslt/mmap source, written under src/main/resources/mapping/
     this.warnings = [];
     this.processIdMap = processIdMap || new Map(); // caller-facing localProcesses[].id -> real generated Process_N id
     this.endEventKind = "message"; // "message" (default, main flow) | "none" (Local Integration Process — see createEndEventNode)
@@ -298,6 +308,65 @@ function createSftpStartNode(step, g) {
   return id;
 }
 
+// SOAP-Sender-triggered start (WS-Security-secured inbound SOAP endpoint) — property
+// shape transcribed verbatim 2026-08-17 from a real Discover-downloaded reference
+// package (a B2B buyer/supplier purchase-order flow: an S/4 Cloud "S4CEBuyer" sender
+// posting into this iFlow's SOAP endpoint). NOT independently confirmed against this
+// tenant's own validator yet — see this file's header note.
+function soapStartMessageFlowXml(mfId, sourceRef, targetRef, adapter, system) {
+  const props =
+    ifl("Name", "SOAP") +
+    ifl("system", system) +
+    ifl("ComponentType", "SOAP") +
+    ifl("ComponentNS", "sap") +
+    ifl("direction", "Sender") +
+    ifl("TransportProtocol", "HTTP") +
+    ifl("MessageProtocol", "SOAP 1.x") +
+    ifl("address", adapter.address) +
+    ifl("senderAuthType", adapter.senderAuthType || "RoleBased") +
+    ifl("userRole", adapter.userRole || "ESBMessaging.send") +
+    ifl("WSSecurityType", adapter.wsSecurityType || "VerifyMessage") +
+    ifl("WSSecurity", adapter.wsSecurity || "None") +
+    ifl("X509TokenAssertion", adapter.x509TokenAssertion || "WssX509V3Token10") +
+    ifl("AlgorithmSuiteAssertion", adapter.algorithmSuiteAssertion || "Basic128Rsa15") +
+    ifl("RecipientTokenIncludeStrategy", adapter.recipientTokenIncludeStrategy || "Never") +
+    ifl("InitiatorTokenIncludeStrategy", adapter.initiatorTokenIncludeStrategy || "AlwaysToRecipient") +
+    ifl("soapOptions", adapter.soapOptions || "cxfRobust") +
+    ifl("maximumBodySize", String(adapter.maximumBodySizeMb ?? 40)) +
+    ifl("maximumAttachmentSize", String(adapter.maximumAttachmentSizeMb ?? 100)) +
+    ifl("componentVersion", "1.2") +
+    ifl("TransportProtocolVersion", "1.2.0") +
+    ifl("MessageProtocolVersion", "1.2.0") +
+    ifl("ComponentSWCVName", "external") +
+    ifl("ComponentSWCVId", "1.2.0") +
+    ifl("cmdVariantUri", "ctype::AdapterVariant/cname::sap:SOAP/tp::HTTP/mp::SOAP 1.x/direction::Sender/version::1.2");
+  return `<bpmn2:messageFlow id="${mfId}" name="SOAP" sourceRef="${sourceRef}" targetRef="${targetRef}"><bpmn2:extensionElements>${props}</bpmn2:extensionElements></bpmn2:messageFlow>`;
+}
+
+function createSoapStartNode(step, g) {
+  const id = g.ids.next("StartEvent");
+  const name = sanitizeElementName(step.name, "Start");
+  const { participantId, system } = mkParticipant(g, `${name}_Sender`, "sender", id, "left");
+  const mfId = g.ids.next("MessageFlow");
+  const mfXml = soapStartMessageFlowXml(mfId, participantId, id, step.adapter, system);
+  g.messageFlows.push({ id: mfId, sourceRef: participantId, targetRef: id, xml: mfXml });
+
+  g.nodes.set(id, {
+    x: 0, y: 0, w: 32, h: 32,
+    render: (incoming, outgoing) => (
+      `<bpmn2:startEvent id="${id}" name="${attrEscape(name)}">` +
+      `<bpmn2:extensionElements>` +
+      ifl("componentVersion", "1.0") +
+      ifl("cmdVariantUri", "ctype::FlowstepVariant/cname::MessageStartEvent/version::1.0") +
+      ifl("activityType", "StartEvent") +
+      `</bpmn2:extensionElements>` +
+      outgoing.map((o) => `<bpmn2:outgoing>${o}</bpmn2:outgoing>`).join("") +
+      `<bpmn2:messageEventDefinition/></bpmn2:startEvent>`
+    ),
+  });
+  return id;
+}
+
 // Bare BPMN "None Start Event" — no ifl: extensionElements at all. Used ONLY as the
 // synthetic entry point of a Local Integration Process's own chain (see
 // buildLocalProcessGraph below): a process invoked via Process Call isn't triggered
@@ -432,6 +501,82 @@ function createGroovyNode(step, g) {
       ifl("cmdVariantUri", "ctype::FlowstepVariant/cname::GroovyScript/version::1.1.2") +
       ifl("subActivityType", "GroovyScript") +
       ifl("script", filename) +
+      `</bpmn2:extensionElements>` +
+      incoming.map((i) => `<bpmn2:incoming>${i}</bpmn2:incoming>`).join("") +
+      outgoing.map((o) => `<bpmn2:outgoing>${o}</bpmn2:outgoing>`).join("") +
+      `</bpmn2:callActivity>`
+    ),
+  });
+  return id;
+}
+
+// XSLT Mapping step — property shape transcribed verbatim 2026-08-17 from a real
+// Discover-downloaded reference package (the B2B purchase-order flow used two of
+// these, named "XSLTMapping1"/"XSLTMapping2", for order-item filtering ahead of a
+// downstream Message Mapping step). Same activityType ("Mapping") as
+// createMessageMappingNode below, but a distinct subActivityType/cmdVariantUri/
+// mappinguri shape — CPI treats them as different mapping engines. The XSLT source
+// itself is written into the package as its own file (src/main/resources/mapping/
+// <name>.xsl), same mechanism createGroovyNode already uses for scripts, just a
+// different target folder (see g.mappingFiles / domains/iflowBuilder.js's zip
+// assembly). NOT independently confirmed against this tenant's own validator yet.
+function createXsltMappingNode(step, g) {
+  const id = g.ids.next("CallActivity");
+  const name = sanitizeElementName(step.name, "XSLT_Mapping");
+  g.mappingFiles[`${name}.xsl`] = step.xslt;
+  g.nodes.set(id, {
+    x: 0, y: 0, w: 100, h: 80,
+    render: (incoming, outgoing) => (
+      `<bpmn2:callActivity id="${id}" name="${attrEscape(name)}">` +
+      `<bpmn2:extensionElements>` +
+      ifl("mappinguri", `dir://mapping/xslt/src/main/resources/mapping/${name}.xsl`) +
+      ifl("mappingname", name) +
+      ifl("mappingpath", `src/main/resources/mapping/${name}`) +
+      ifl("mappingoutputformat", "Bytes") +
+      ifl("mappingSource", "mappingSrcIflow") +
+      ifl("mappingHeaderNameKey", "") +
+      ifl("componentVersion", "1.2") +
+      ifl("activityType", "Mapping") +
+      ifl("subActivityType", "XSLTMapping") +
+      ifl("cmdVariantUri", "ctype::FlowstepVariant/cname::XSLTMapping/version::1.2.0") +
+      `</bpmn2:extensionElements>` +
+      incoming.map((i) => `<bpmn2:incoming>${i}</bpmn2:incoming>`).join("") +
+      outgoing.map((o) => `<bpmn2:outgoing>${o}</bpmn2:outgoing>`).join("") +
+      `</bpmn2:callActivity>`
+    ),
+  });
+  return id;
+}
+
+// Message Mapping (graphical .mmap) step — PASS-THROUGH ONLY. This generator does
+// not synthesize a valid XI-Trafo brick-tree from scratch (SAP's proprietary
+// graphical-mapping export format — a flat tree of <brick> field-mapping/function
+// nodes wrapped in xiObj/tr:XiTrafo XML — isn't something worth hand-authoring here);
+// the caller supplies the full, already-authored .mmap XML content (exported from
+// another package, or hand-built in the web editor's Message Mapping tool) and this
+// just wires it into the flow with the confirmed step schema and writes it into the
+// package as its own file (src/main/resources/mapping/<name>.mmap). Confirmed real
+// property shape 2026-08-17 from THREE independent Discover-downloaded reference
+// packages — the version suffix on cmdVariantUri varies across them (none / 1.1.0 /
+// 1.2.1 all seen live in different packages), so this uses the newest observed as a
+// default; override via a future field if a specific tenant needs a different one.
+// NOT independently confirmed against this tenant's own validator yet.
+function createMessageMappingNode(step, g) {
+  const id = g.ids.next("CallActivity");
+  const name = sanitizeElementName(step.name, "Message_Mapping");
+  g.mappingFiles[`${name}.mmap`] = step.mmapContent;
+  g.nodes.set(id, {
+    x: 0, y: 0, w: 100, h: 80,
+    render: (incoming, outgoing) => (
+      `<bpmn2:callActivity id="${id}" name="${attrEscape(name)}">` +
+      `<bpmn2:extensionElements>` +
+      ifl("mappingType", "MessageMapping") +
+      ifl("mappinguri", `dir://mmap/src/main/resources/mapping/${name}.mmap`) +
+      ifl("mappingname", name) +
+      ifl("mappingpath", `src/main/resources/mapping/${name}`) +
+      ifl("componentVersion", "1.2") +
+      ifl("activityType", "Mapping") +
+      ifl("cmdVariantUri", "ctype::FlowstepVariant/cname::MessageMapping/version::1.2.1") +
       `</bpmn2:extensionElements>` +
       incoming.map((i) => `<bpmn2:incoming>${i}</bpmn2:incoming>`).join("") +
       outgoing.map((o) => `<bpmn2:outgoing>${o}</bpmn2:outgoing>`).join("") +
@@ -1043,6 +1188,164 @@ function processDirectMessageFlowXml(mfId, sourceRef, targetRef, adapter, system
   return `<bpmn2:messageFlow id="${mfId}" name="ProcessDirect" sourceRef="${sourceRef}" targetRef="${targetRef}"><bpmn2:extensionElements>${props}</bpmn2:extensionElements></bpmn2:messageFlow>`;
 }
 
+// Dedicated SuccessFactors adapter (ComponentType SuccessFactors, cname
+// sap:SuccessFactors) — property shape transcribed verbatim 2026-08-17 from THREE
+// independent Discover-downloaded reference packages (a SuccessFactors->ServiceNow
+// user-replication flow and a SuccessFactors EC "Job Information" family of four
+// flows), all agreeing on the same core property set. Distinct from the generic
+// "odata"/"odatav4" types above — use this one for actual SuccessFactors OData V2
+// calls (Query(GET) and Upsert(UPSERT) operations both confirmed present in the
+// reference packages). NOT independently confirmed against this tenant's own
+// validator yet.
+function successFactorsMessageFlowXml(mfId, sourceRef, targetRef, adapter, system, g) {
+  if (!adapter.credentialName) {
+    g.warnings.push(`SuccessFactors adapter targeting "${system}": no credentialName given.`);
+  }
+  const props =
+    ifl("Name", "SuccessFactors") +
+    ifl("system", system) +
+    ifl("ComponentType", "SuccessFactors") +
+    ifl("ComponentNS", "sap") +
+    ifl("direction", "Receiver") +
+    ifl("TransportProtocol", "HTTP") +
+    ifl("MessageProtocol", "OData V2") +
+    ifl("address", adapter.address) +
+    ifl("resourcePath", adapter.resourcePath) +
+    ifl("operation", adapter.operation || "Query(GET)") +
+    ifl("queryOptions", adapter.queryOptions || "") +
+    ifl("fields", adapter.fields || "") +
+    ifl("authenticationMethod", adapter.authenticationMethod || "Basic") +
+    ifl("alias", adapter.credentialName || "") +
+    ifl("edmxFilePath", adapter.edmxFilePath || "") +
+    ifl("urlSuffixSfOData", adapter.urlSuffixSfOData || "/odata/v2") +
+    ifl("sfsfODataReceiverDataCenterUrl", adapter.sfsfODataReceiverDataCenterUrl || "Other") +
+    ifl("contentType", adapter.contentType || "application/atom+xml") +
+    ifl("enableBatchProcessing", adapter.enableBatchProcessing ? "1" : "0") +
+    ifl("receiveTimeOut", String(adapter.timeoutSec ?? 60)) +
+    ifl("componentVersion", "1.21") +
+    ifl("TransportProtocolVersion", "1.21.0") +
+    ifl("MessageProtocolVersion", "1.21.0") +
+    ifl("ComponentSWCVName", "external") +
+    ifl("ComponentSWCVId", "1.21.0") +
+    ifl("cmdVariantUri", "ctype::AdapterVariant/cname::sap:SuccessFactors/tp::HTTP/mp::OData V2/direction::Receiver/version::1.21.0");
+  return `<bpmn2:messageFlow id="${mfId}" name="SuccessFactors" sourceRef="${sourceRef}" targetRef="${targetRef}"><bpmn2:extensionElements>${props}</bpmn2:extensionElements></bpmn2:messageFlow>`;
+}
+
+// Dedicated third-party ServiceNow adapter (ComponentType ServiceNow, cname
+// ServiceNow, vendor rojoconsultancy.com — note NO /version:: suffix on cmdVariantUri,
+// confirmed real from the reference package as-is). Property shape transcribed
+// verbatim 2026-08-17 from a Discover-downloaded reference package (a
+// SuccessFactors->ServiceNow user-replication flow using CREATE/UPDATE/QUERY
+// operations against the sys_user table). `query` builds the confirmed sysparmquery
+// row-XML for a QUERY operation. NOT independently confirmed against this tenant's
+// own validator yet.
+function serviceNowMessageFlowXml(mfId, sourceRef, targetRef, adapter, system, g) {
+  if (!adapter.credentialName) {
+    g.warnings.push(`ServiceNow adapter targeting "${system}": no credentialName given.`);
+  }
+  const version = adapter.operation === "CREATE" ? "v2/" : "now";
+  const queryRow = adapter.query
+    ? rowKeyed([
+        ["QueryParamValue", adapter.query.paramValue],
+        ["QueryParamName", adapter.query.paramName],
+        ["QueryParamCondition", adapter.query.condition || "^OR"],
+        ["QueryOperation", adapter.query.operation || "="],
+      ])
+    : "";
+  const props =
+    ifl("Name", `ServiceNow_${adapter.operation || "QUERY"}`) +
+    ifl("system", system) +
+    ifl("ComponentType", "ServiceNow") +
+    ifl("Vendor", "rojoconsultancy.com") +
+    ifl("ComponentNS", "sap") +
+    ifl("direction", "Receiver") +
+    ifl("TransportProtocol", "HTTPS") +
+    ifl("MessageProtocol", "REST") +
+    ifl("address", adapter.address) +
+    ifl("tableName", adapter.tableName || "sys_user") +
+    ifl("OperationName", adapter.operation || "QUERY") +
+    ifl("itemID", adapter.itemID || "") +
+    ifl("version", version) +
+    ifl("sysparmquery", queryRow) +
+    ifl("noCount", adapter.operation === "QUERY" ? "0" : "") +
+    ifl("payloadFormat", adapter.payloadFormat || "xml") +
+    ifl("payloadFormatResponse", adapter.payloadFormat || "xml") +
+    ifl("authentication", adapter.authentication || "basic") +
+    ifl("credentials", adapter.credentialName || "") +
+    ifl("clientID", adapter.clientIdAlias || "") +
+    ifl("clientSecret", adapter.clientSecretAlias || "") +
+    // Confirmed real 2026-08-17 (live validator round-trip against this tenant): the
+    // ServiceNow adapter has NO "componentVersion" property at all — sending one
+    // (even the plausible-looking "1.0") fails validation with "This component
+    // ServiceNow with version 1.0 is not supported in Cloud Integration profile."
+    // Every OTHER adapter builder in this file DOES set componentVersion; this one is
+    // a confirmed exception, not an oversight — do not add it back.
+    ifl("sysparmfields", "") +
+    ifl("queryparams", "") +
+    ifl("queryManual", "") +
+    ifl("orderby", "") +
+    ifl("headerparams", "") +
+    ifl("sysparmsuppresspaginationheader", "0") +
+    ifl("sysparmquerynodomain", "false") +
+    ifl("sysparminputdisplayvalue", "0") +
+    ifl("sysparmsuppressautosysfield", "0") +
+    ifl("sysparmview", "Both") +
+    ifl("sysparmoffset", "0") +
+    ifl("sysparmlimit", "1000") +
+    ifl("sysparmdisplayvalue", "false") +
+    ifl("sysparmexcludereferencelink", "0") +
+    ifl("TransportProtocolVersion", "1.0.0") +
+    ifl("MessageProtocolVersion", "1.0.0") +
+    ifl("ComponentSWCVName", "external") +
+    ifl("ComponentSWCVId", "1.0.0") +
+    ifl("cmdVariantUri", "ctype::AdapterVariant/cname::ServiceNow/vendor::rojoconsultancy.com/tp::HTTPS/mp::REST/direction::Receiver");
+  return `<bpmn2:messageFlow id="${mfId}" name="ServiceNow" sourceRef="${sourceRef}" targetRef="${targetRef}"><bpmn2:extensionElements>${props}</bpmn2:extensionElements></bpmn2:messageFlow>`;
+}
+
+// IDoc-over-HTTP receiver (ComponentType IDOC, MessageProtocol "IDoc SOAP") — posts
+// an IDoc payload to an on-premise SAP system, typically via SAP Cloud Connector
+// (proxyType "sapcc"). Property shape transcribed verbatim 2026-08-17 from a
+// Discover-downloaded reference package (a B2B buyer/supplier purchase-order flow
+// posting ORDERS05/ORDCHG IDocs). In that reference the adapter was wired to a plain
+// Message End Event rather than a ServiceTask (a CPI pattern this generator's
+// architecture doesn't model — see createEndEventNode); this builder instead exposes
+// it via the standard ServiceTask mechanism every other receiver adapter here uses.
+// CONFIRMED LIVE 2026-08-17 against this tenant's own validator: kind:"send" is
+// REJECTED ("Post_IDoc_OnPrem is not supported for the adapter") — only kind:
+// "requestReply" (ExternalCall) validates cleanly, despite the reference's own
+// fire-and-forget End-Event wiring suggesting "send" semantics. See
+// ADAPTER_KIND_RESTRICTION below, which now enforces this.
+function idocMessageFlowXml(mfId, sourceRef, targetRef, adapter, system, g) {
+  if (!adapter.credentialName) {
+    g.warnings.push(`IDOC adapter targeting "${system}": no credentialName given.`);
+  }
+  const props =
+    ifl("Name", "IDOC") +
+    ifl("system", system) +
+    ifl("ComponentType", "IDOC") +
+    ifl("ComponentNS", "sap") +
+    ifl("direction", "Receiver") +
+    ifl("TransportProtocol", "HTTP") +
+    ifl("MessageProtocol", "IDoc SOAP") +
+    ifl("address", adapter.address) +
+    ifl("authentication", adapter.authentication || "Basic") +
+    ifl("credentialName", adapter.credentialName || "") +
+    ifl("proxyType", adapter.proxyType || "sapcc") +
+    ifl("IDocContentType", "text/xml") +
+    ifl("allowChunking", adapter.allowChunking === false ? "0" : "1") +
+    ifl("cleanupHeaders", adapter.cleanupHeaders === false ? "0" : "1") +
+    ifl("CompressMessage", adapter.compressMessage ? "1" : "0") +
+    ifl("requestTimeout", String(adapter.requestTimeoutMs ?? 60000)) +
+    ifl("locationID", adapter.locationID || "") +
+    ifl("componentVersion", "1.3") +
+    ifl("TransportProtocolVersion", "1.3.0") +
+    ifl("MessageProtocolVersion", "1.3.0") +
+    ifl("ComponentSWCVName", "external") +
+    ifl("ComponentSWCVId", "1.3.0") +
+    ifl("cmdVariantUri", "ctype::AdapterVariant/cname::sap:IDOC/tp::HTTP/mp::IDoc SOAP/direction::Receiver/version::1.3");
+  return `<bpmn2:messageFlow id="${mfId}" name="IDOC" sourceRef="${sourceRef}" targetRef="${targetRef}"><bpmn2:extensionElements>${props}</bpmn2:extensionElements></bpmn2:messageFlow>`;
+}
+
 const SEND_ADAPTER_BUILDERS = {
   http: httpMessageFlowXml,
   mail: mailMessageFlowXml,
@@ -1052,6 +1355,9 @@ const SEND_ADAPTER_BUILDERS = {
   jms: jmsMessageFlowXml,
   soap: soapMessageFlowXml,
   processDirect: processDirectMessageFlowXml,
+  successfactors: successFactorsMessageFlowXml,
+  servicenow: serviceNowMessageFlowXml,
+  idoc: idocMessageFlowXml,
 };
 
 // Each adapter type here is only valid under ONE of "send"/"requestReply" — CPI's own
@@ -1063,7 +1369,12 @@ const SEND_ADAPTER_BUILDERS = {
 // misreading of which ServiceTask AI_Agent_Reference_IFlow's SOAP messageFlow was
 // actually paired with; the live validator error corrected that). processDirect is
 // the mirror case — requestReply-only, confirmed live the same day.
-const ADAPTER_KIND_RESTRICTION = { sftpWrite: "send", soap: "send", processDirect: "requestReply" };
+// idoc: "requestReply" confirmed live 2026-08-17 against this tenant's own validator
+// — kind:"send" fails with "<name> is not supported for the adapter" (same failure
+// class as sftpWrite/soap/processDirect above), even though the reference package
+// this adapter was transcribed from wired IDOC to a plain Message End Event instead
+// of either ServiceTask flavor.
+const ADAPTER_KIND_RESTRICTION = { sftpWrite: "send", soap: "send", processDirect: "requestReply", idoc: "requestReply" };
 
 function createServiceTaskNode(step, g) {
   const id = g.ids.next("ServiceTask");
@@ -1080,7 +1391,7 @@ function createServiceTaskNode(step, g) {
       ? "ctype::FlowstepVariant/cname::Send/version::1.0.4"
       : "ctype::FlowstepVariant/cname::ExternalCall/version::1.0.4";
 
-  const suffix = { http: "Endpoint", mail: "Mail_Server", odata: "OData_Service", odatav4: "OData_V4_Service", sftpWrite: "Sftp_Server", jms: "Queue", soap: "Soap_Service", processDirect: "Process" }[step.adapter.type] || "Endpoint";
+  const suffix = { http: "Endpoint", mail: "Mail_Server", odata: "OData_Service", odatav4: "OData_V4_Service", sftpWrite: "Sftp_Server", jms: "Queue", soap: "Soap_Service", processDirect: "Process", successfactors: "SuccessFactors", servicenow: "ServiceNow", idoc: "IDoc_Receiver" }[step.adapter.type] || "Endpoint";
   // Confirmed live 2026-08-16 from a hand-built reference flow (WeatherForecastMailIFlow,
   // edited directly in the SAP web editor): a requestReply/send step's own receiver
   // participant sits ABOVE the pool (negative y relative to it), never "below" — "below"
@@ -1224,8 +1535,11 @@ function createNode(step, g) {
     case "timer": return createTimerNode(step, g);
     case "httpsStart": return createHttpsStartNode(step, g);
     case "sftpStart": return createSftpStartNode(step, g);
+    case "soapStart": return createSoapStartNode(step, g);
     case "contentModifier": return createContentModifierNode(step, g);
     case "groovyScript": return createGroovyNode(step, g);
+    case "xsltMapping": return createXsltMappingNode(step, g);
+    case "messageMapping": return createMessageMappingNode(step, g);
     case "requestReply":
     case "send": return createServiceTaskNode(step, g);
     case "pollEnrich": return createPollEnrichNode(step, g);
@@ -1354,7 +1668,7 @@ export function buildLocalProcessGraph(steps, sharedIds, processIdMap) {
 // whether/how a subprocess-nested adapter's participant+messageFlow should be
 // diagrammed isn't, so this is refused outright rather than silently producing
 // orphaned/broken output.
-const SUBPROCESS_UNSAFE_KINDS = new Set(["timer", "httpsStart", "sftpStart", "requestReply", "send", "pollEnrich"]);
+const SUBPROCESS_UNSAFE_KINDS = new Set(["timer", "httpsStart", "sftpStart", "soapStart", "requestReply", "send", "pollEnrich"]);
 function assertSubprocessSafeSteps(steps, context) {
   for (const s of steps || []) {
     if (SUBPROCESS_UNSAFE_KINDS.has(s.kind)) {
@@ -1421,6 +1735,7 @@ export async function renderExceptionSubprocess(name, handlingSteps, endKind, sh
     xml,
     subProcessId,
     scripts: rendered.scripts,
+    mappingFiles: rendered.mappingFiles,
     warnings: rendered.warnings,
     collaborationExtra: rendered.collaborationExtra, // empty in practice — assertSubprocessSafeSteps refuses any adapter step that would populate this
     diagramInner: subProcessShape + rendered.diagramInner,
@@ -1610,6 +1925,7 @@ export async function renderFlowGraph(g, origin = { x: POOL_X, y: POOL_Y }) {
     collaborationExtra: participantXmls.join("") + messageFlowXmls.join(""),
     diagramInner: shapeXmls.join("") + edgeXmls.join(""),
     scripts: g.scripts,
+    mappingFiles: g.mappingFiles,
     warnings: g.warnings,
     pool,
     stackingHeight,
@@ -1659,6 +1975,7 @@ export async function assembleIflow(spec) {
 
   const warnings = [];
   const scripts = {};
+  const mappingFiles = {};
 
   // Single running cursor stacking EVERY diagrammed block (main pool, main's own
   // Exception Subprocess, each Local Integration Process, each of ITS Exception
@@ -1673,6 +1990,7 @@ export async function assembleIflow(spec) {
   const mainRendered = await renderFlowGraph(mainGraph);
   warnings.push(...mainRendered.warnings);
   Object.assign(scripts, mainRendered.scripts);
+  Object.assign(mappingFiles, mainRendered.mappingFiles);
 
   let processInner = mainRendered.processInner;
   let collaborationExtra = mainRendered.collaborationExtra;
@@ -1698,6 +2016,7 @@ export async function assembleIflow(spec) {
     processInner += sub.xml;
     warnings.push(...sub.warnings);
     Object.assign(scripts, sub.scripts);
+    Object.assign(mappingFiles, sub.mappingFiles);
     collaborationExtra += sub.collaborationExtra;
     diagramInner += sub.diagramInner;
     mainPoolWidth = poolWidth;
@@ -1717,6 +2036,7 @@ export async function assembleIflow(spec) {
     const lpRendered = await renderFlowGraph(lpGraph, { x: POOL_X, y: offsetY });
     warnings.push(...lpRendered.warnings);
     Object.assign(scripts, lpRendered.scripts);
+    Object.assign(mappingFiles, lpRendered.mappingFiles);
     collaborationExtra += lpRendered.collaborationExtra; // e.g. a requestReply/send step's own adapter participant
     diagramInner += lpRendered.diagramInner;
     // Same split as the main pool above: `blockContentHeight` sizes this local
@@ -1734,6 +2054,7 @@ export async function assembleIflow(spec) {
       lpInner += sub.xml;
       warnings.push(...sub.warnings);
       Object.assign(scripts, sub.scripts);
+      Object.assign(mappingFiles, sub.mappingFiles);
       collaborationExtra += sub.collaborationExtra;
       diagramInner += sub.diagramInner;
       blockWidth = poolWidth;
@@ -1784,6 +2105,7 @@ export async function assembleIflow(spec) {
     diagramInner,
     extraProcessesXml,
     scripts,
+    mappingFiles,
     warnings,
     pool: mainPool,
   };

@@ -24,17 +24,16 @@ applications:
       # CPI_CREDSTORE_KEY: cpi-oauth-secret
       # CPI_CREDSTORE_NAMESPACE: cpi-mcp   # optional, defaults to "cpi-mcp"
     #
-    # Uncomment once you've created the instance (cf create-service credstore <plan>
-    # cpi-credstore) and are ready to use CPI_CREDSTORE_KEY above. CF injects rotating
-    # access credentials into VCAP_SERVICES (Basic-auth username/password on trial-plan
-    # instances, or an x509 client cert on plans configured for mTLS — src/credStore.js
-    # handles either).
-    # services:
-    #   - cpi-credstore
+    # Bound below — requires CPI_CREDSTORE_KEY above to be set for whichever tenant
+    # should use it. CF injects rotating access credentials into VCAP_SERVICES
+    # (Basic-auth username/password on trial-plan instances, or an x509 client cert on
+    # plans configured for mTLS — src/credStore.js handles either).
     #
     # Alternative to Credential Store: a user-provided service (still plaintext, but out
-    # of manifest.yml/CI history). Only use this INSTEAD of cpi-credstore above, not
+    # of manifest.yml/CI history). Only use this INSTEAD of cpi-credstore below, not
     # alongside it — create it first with:
     #   cf cups cpi-credentials -p '{"clientId":"...","clientSecret":"..."}'
     # services:
     #   - cpi-credentials
+    services:
+      - cpi-credstore

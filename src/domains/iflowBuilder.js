@@ -99,6 +99,29 @@ const StepSchema = z.lazy(() =>
         "on this. To poll SFTP MID-flow instead of triggering the flow, use kind:\"pollEnrich\"/type:\"sftpPoll\"."
     ),
     z.object({
+      kind: z.literal("soapStart"),
+      name: z.string(),
+      adapter: z.object({
+        address: z.string().describe("Inbound path, e.g. /EDI/OrderRequest_In."),
+        senderAuthType: z.enum(["RoleBased", "ClientCertificate", "None"]).default("RoleBased"),
+        userRole: z.string().default("ESBMessaging.send").describe("Required when senderAuthType is RoleBased."),
+        wsSecurityType: z.string().default("VerifyMessage"),
+        wsSecurity: z.string().default("None"),
+        x509TokenAssertion: z.string().default("WssX509V3Token10"),
+        algorithmSuiteAssertion: z.string().default("Basic128Rsa15"),
+        recipientTokenIncludeStrategy: z.string().default("Never"),
+        initiatorTokenIncludeStrategy: z.string().default("AlwaysToRecipient"),
+        soapOptions: z.string().default("cxfRobust"),
+        maximumBodySizeMb: z.number().int().default(40),
+        maximumAttachmentSizeMb: z.number().int().default(100),
+      }),
+    }).describe(
+      "Alternative first step: a WS-Security-secured inbound SOAP endpoint. Property shape transcribed verbatim " +
+        "2026-08-17 from a Discover-downloaded reference package (a B2B buyer/supplier purchase-order flow). NOT " +
+        "independently confirmed against this tenant's own validator yet — verify in the web editor's Problems " +
+        "tab before relying on it."
+    ),
+    z.object({
       kind: z.literal("contentModifier"),
       name: z.string(),
       properties: z.array(PropertyRow).default([]).describe("Exchange properties to set."),
@@ -130,6 +153,30 @@ const StepSchema = z.lazy(() =>
       name: z.string(),
       script: z.string().describe("Full Groovy source implementing `Message processData(Message message)` (package script; import Message)."),
     }),
+    z.object({
+      kind: z.literal("xsltMapping"),
+      name: z.string(),
+      xslt: z.string().describe("Full XSLT source. Written into the package as its own file (src/main/resources/mapping/<name>.xsl)."),
+    }).describe(
+      "XSLT Mapping step. Property shape transcribed verbatim 2026-08-17 from a Discover-downloaded reference " +
+        "package (used there for order-item filtering ahead of a downstream Message Mapping step). NOT " +
+        "independently confirmed against this tenant's own validator yet."
+    ),
+    z.object({
+      kind: z.literal("messageMapping"),
+      name: z.string(),
+      mmapContent: z.string().describe(
+        "Full, already-authored graphical Message Mapping (.mmap) XML content — this tool does NOT synthesize a " +
+          "valid mapping from scratch (SAP's proprietary XI-Trafo brick-tree export format isn't worth hand-" +
+          "authoring here). Supply content exported from another package, or hand-built in the web editor's " +
+          "Message Mapping tool. Written into the package as its own file (src/main/resources/mapping/<name>.mmap)."
+      ),
+    }).describe(
+      "Message Mapping step — PASS-THROUGH ONLY (see mmapContent). Property shape transcribed verbatim 2026-08-17 " +
+        "from THREE independent Discover-downloaded reference packages (the cmdVariantUri version suffix varies " +
+        "across them — none/1.1.0/1.2.1 all seen live — this uses the newest observed). NOT independently " +
+        "confirmed against this tenant's own validator yet."
+    ),
     z.object({
       kind: z.enum(["requestReply", "send"]),
       name: z.string(),
@@ -260,6 +307,70 @@ const StepSchema = z.lazy(() =>
             "kind:\"requestReply\", NOT kind:\"send\" — confirmed live (2026-08-16): CPI's validator rejects it " +
             "under Send with \"<name> is not supported for the adapter\"; this tool now refuses that combination " +
             "outright before ever pushing to the tenant."
+        ),
+        z.object({
+          type: z.literal("successfactors"),
+          address: z.string().describe("SuccessFactors OData V2 host, e.g. https://api12.successfactors.com — resourcePath carries the entity name, not this field."),
+          resourcePath: z.string().describe("SuccessFactors OData V2 entity name, e.g. \"User\", \"EmpJob\", \"TemporaryTimeInformation\"."),
+          operation: z.enum(["Query(GET)", "Upsert(UPSERT)"]).default("Query(GET)").describe("Only these two values are confirmed present in reference packages; other SuccessFactors-specific operations may exist but aren't verified here."),
+          queryOptions: z.string().optional().describe("Static $select/$filter/$expand, e.g. a delta filter like \"$filter=lastModifiedDateTime ge datetimeoffset'${property.QueryDate}'\"."),
+          fields: z.string().optional().describe("Comma-separated field list for response pruning (maps to the adapter's 'fields' property)."),
+          authenticationMethod: z.enum(["Basic", "OAuth2SAMLBearer", "OAuth2ClientCredentials"]).default("Basic"),
+          credentialName: z.string().optional().describe("Security Material credential alias — maps to the channel's 'alias' property."),
+          edmxFilePath: z.string().optional().describe("Path to an uploaded OData metadata (.edmx) file inside the package, e.g. \"edmx/api10_successfactors_com_odata_v2.edmx\" — this tool does NOT generate or upload the edmx file itself; it must already exist in the target package for the adapter's metadata browser to work."),
+          urlSuffixSfOData: z.string().default("/odata/v2"),
+          sfsfODataReceiverDataCenterUrl: z.string().default("Other"),
+          contentType: z.enum(["application/atom+xml", "application/json"]).default("application/atom+xml"),
+          enableBatchProcessing: z.boolean().default(false),
+          timeoutSec: z.number().int().default(60),
+        }).describe(
+          "Dedicated SuccessFactors adapter (ComponentType SuccessFactors) — distinct from the generic 'odata'/" +
+            "'odatav4' types above. Property shape transcribed verbatim 2026-08-17 from THREE independent " +
+            "Discover-downloaded reference packages. NOT independently confirmed against this tenant's own " +
+            "validator yet."
+        ),
+        z.object({
+          type: z.literal("servicenow"),
+          address: z.string().describe("ServiceNow instance host, e.g. https://yourinstance.service-now.com."),
+          tableName: z.string().default("sys_user").describe("ServiceNow table name."),
+          operation: z.enum(["CREATE", "UPDATE", "QUERY"]).default("QUERY").describe("Maps to the adapter's OperationName property."),
+          itemID: z.string().optional().describe("Record sys_id (e.g. \"${property.sys_id}\") — required for UPDATE, unused otherwise."),
+          query: z
+            .object({
+              paramName: z.string().describe("Field to query by, e.g. \"email\"."),
+              paramValue: z.string().describe("Value/expression to match, e.g. \"${property.SF_Empl_Email}\"."),
+              condition: z.string().default("^OR"),
+              operation: z.string().default("="),
+            })
+            .optional()
+            .describe("Builds the confirmed sysparmquery row-XML — only meaningful when operation is QUERY."),
+          payloadFormat: z.enum(["xml", "json"]).default("xml"),
+          authentication: z.enum(["basic", "oauth2"]).default("basic"),
+          credentialName: z.string().optional().describe("Maps to the adapter's 'credentials' property."),
+          clientIdAlias: z.string().optional(),
+          clientSecretAlias: z.string().optional(),
+        }).describe(
+          "Dedicated third-party ServiceNow adapter (ComponentType ServiceNow, vendor rojoconsultancy.com). " +
+            "Property shape transcribed verbatim 2026-08-17 from a Discover-downloaded reference package. NOT " +
+            "independently confirmed against this tenant's own validator yet."
+        ),
+        z.object({
+          type: z.literal("idoc"),
+          address: z.string().describe("Target IDoc-over-HTTP endpoint, e.g. http://<host>:<port>/sap/bc/srt/idoc?sap-client=<client>."),
+          authentication: z.enum(["Basic", "ClientCertificate"]).default("Basic"),
+          credentialName: z.string().optional(),
+          proxyType: z.string().default("sapcc").describe("\"sapcc\" = via SAP Cloud Connector, confirmed real from the reference package."),
+          locationID: z.string().optional().describe("Cloud Connector virtual-to-internal-host mapping location id, if applicable."),
+          allowChunking: z.boolean().default(true),
+          cleanupHeaders: z.boolean().default(true),
+          compressMessage: z.boolean().default(false),
+          requestTimeoutMs: z.number().int().default(60000),
+        }).describe(
+          "IDoc-over-HTTP receiver (ComponentType IDOC, MessageProtocol \"IDoc SOAP\"). Property shape transcribed " +
+            "verbatim 2026-08-17 from a Discover-downloaded reference package. ONLY valid as kind:\"requestReply\", " +
+            "NOT kind:\"send\" — confirmed live 2026-08-17 against this tenant's own validator (\"<name> is not " +
+            "supported for the adapter\" under Send); this tool refuses that combination outright before ever " +
+            "pushing to the tenant."
         ),
       ]),
     }),
@@ -422,7 +533,7 @@ function exceptionSubprocessSchema() {
 
 // --- small local helpers -------------------------------------------------------
 
-async function assembleOfflineZip({ id, name, iflw, prop, propdef, scripts }) {
+async function assembleOfflineZip({ id, name, iflw, prop, propdef, scripts, mappingFiles, xsdFiles }) {
   const zip = new JSZip();
   // Explicit directory entries + a real file directly in src/main/resources — both
   // confirmed necessary when a zip is authored from scratch rather than modifying a
@@ -435,6 +546,8 @@ async function assembleOfflineZip({ id, name, iflw, prop, propdef, scripts }) {
     "src/main/resources/scenarioflows/",
     "src/main/resources/scenarioflows/integrationflow/",
     "src/main/resources/script/",
+    "src/main/resources/mapping/",
+    "src/main/resources/xsd/",
   ]) {
     zip.folder(d);
   }
@@ -446,6 +559,12 @@ async function assembleOfflineZip({ id, name, iflw, prop, propdef, scripts }) {
   zip.file(`src/main/resources/scenarioflows/integrationflow/${id}.iflw`, iflw);
   for (const [filename, content] of Object.entries(scripts)) {
     zip.file(`src/main/resources/script/${filename}`, content);
+  }
+  for (const [filename, content] of Object.entries(mappingFiles || {})) {
+    zip.file(`src/main/resources/mapping/${filename}`, content);
+  }
+  for (const { filename, content } of xsdFiles || []) {
+    zip.file(`src/main/resources/xsd/${filename}`, content);
   }
   return zip.generateAsync({ type: "nodebuffer", platform: "UNIX", compression: "DEFLATE" });
 }
@@ -657,6 +776,19 @@ export function registerIflowBuilderTools(server) {
         "Additional confirmed step kinds (2026-08-16, from a tenant reference flow): filter, xmlModifier, " +
         "writeVariables, splitter + gather (split/aggregate pair), and the four Data Store operations " +
         "(dataStoreGet/Put/Select/Delete). " +
+        "2026-08-17 ADDITIONS (transcribed from Discover-downloaded reference packages, NOT independently " +
+        "confirmed against this tenant's own validator — verify in the web editor's Problems tab): soapStart " +
+        "(alternative first step — WS-Security-secured inbound SOAP endpoint); xsltMapping (XSLT Mapping step, " +
+        "writes the XSLT source into the package as its own file); messageMapping (graphical Message Mapping " +
+        "step — PASS-THROUGH ONLY, the caller supplies already-authored .mmap XML content, this tool does not " +
+        "synthesize one); and three new requestReply/send adapter types — successfactors (dedicated " +
+        "SuccessFactors OData V2 adapter, distinct from generic odata/odatav4; confirmed live 2026-08-17 to need " +
+        "NO componentVersion property), servicenow (dedicated third-party ServiceNow REST adapter — also " +
+        "confirmed live to need NO componentVersion property; separately, this tenant's design workspace does not " +
+        "currently have the ServiceNow adapter available at all, so this type will fail validation here until " +
+        "that's provisioned — a tenant-provisioning gap, not a schema bug), and idoc (IDoc-over-HTTP receiver, " +
+        "typically via SAP Cloud Connector — requestReply ONLY, confirmed live 2026-08-17 that kind:\"send\" is " +
+        "rejected; this tool refuses that combination outright). " +
         "REUSABLE SUB-FLOWS: declare 'localProcesses' (each becomes its own sibling Local Integration Process, " +
         "laid out independently and stacked below the main pool) and call one via a 'processCall' step referencing " +
         "its 'id'. " +
@@ -719,6 +851,16 @@ export function registerIflowBuilderTools(server) {
         name: z.string().describe("Display name."),
         description: z.string().optional(),
         parameters: z.array(ParameterSchema).default([]).describe("Externalized parameters. Any {{Name}} used in steps but not listed here is auto-added."),
+        xsdFiles: z
+          .array(z.object({ filename: z.string().describe('e.g. "SourceDemo.xsd".'), content: z.string().describe("Full XSD source.") }))
+          .default([])
+          .describe(
+            "Raw XSD schema files to bundle into the package at src/main/resources/xsd/<filename> — needed to give " +
+              "a 'messageMapping' step real, resolvable source/target elements (its lnks can reference " +
+              "'src/main/resources/xsd' by filename + root element name). Without this, a messageMapping step's " +
+              "root Dst/Src bricks have no backing schema and CPI's validator flags \"Source/Target element is not " +
+              "assigned\" — expected for a placeholder mapping, avoidable by supplying real XSDs here."
+          ),
         steps: z.array(StepSchema).min(1).describe(`Ordered flow steps; steps[0] must be kind: ${START_KINDS.join(" or ")}.`),
         exceptionSubprocess: exceptionSubprocessSchema(),
         localProcesses: z
@@ -826,7 +968,7 @@ export function registerIflowBuilderTools(server) {
 
         if (args.offline) {
           const iflw = injectFlowContent(buildOfflineShellIflw("Process_1", name.replace(/\s+/g, "_"), "Collaboration_1"), rendered);
-          const zipBuf = await assembleOfflineZip({ id, name, iflw, prop, propdef, scripts: rendered.scripts });
+          const zipBuf = await assembleOfflineZip({ id, name, iflw, prop, propdef, scripts: rendered.scripts, mappingFiles: rendered.mappingFiles, xsdFiles: args.xsdFiles });
           return {
             mode: "offline",
             artifactId: id,
@@ -914,6 +1056,12 @@ export function registerIflowBuilderTools(server) {
         zip.file("src/main/resources/parameters.propdef", propdef);
         for (const [filename, content] of Object.entries(rendered.scripts)) {
           zip.file(`src/main/resources/script/${filename}`, content);
+        }
+        for (const [filename, content] of Object.entries(rendered.mappingFiles || {})) {
+          zip.file(`src/main/resources/mapping/${filename}`, content);
+        }
+        for (const { filename, content } of args.xsdFiles || []) {
+          zip.file(`src/main/resources/xsd/${filename}`, content);
         }
 
         const zipBuf = await zip.generateAsync({ type: "nodebuffer", platform: "UNIX", compression: "DEFLATE" });
